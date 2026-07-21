@@ -144,6 +144,9 @@ class Device:
         self._lock = threading.Lock()
         self._service_version = self._read_service_version()
         self.service_name = service_name
+        self._action_server: ThreadingTCPServer | None = None
+        self._log_server: ThreadingTCPServer | None = None
+        self._servers_lock = threading.Lock()
 
     def _read_service_version(self) -> str | None:
         base = os.path.dirname(os.path.abspath(__file__))
@@ -160,7 +163,48 @@ class Device:
         if not self.report_iface:
             return
         current = _iface_first_ipv4(self.report_iface)
+        old_ip = self.reported_ip
         self.reported_ip = current
+
+        if current != old_ip:
+            if current is None:
+                print(f"[net] {self.report_iface!r} lost IPv4 address; stopping TCP servers")
+                self._stop_tcp_servers()
+            else:
+                if old_ip is not None:
+                    print(f"[net] {self.report_iface!r} IPv4 changed {old_ip} -> {current}; rebinding TCP servers")
+                else:
+                    print(f"[net] {self.report_iface!r} IPv4 acquired {current}; starting TCP servers")
+                self._restart_tcp_servers(current)
+
+    def _start_tcp_servers(self, bind_ip: str) -> None:
+        with self._servers_lock:
+            try:
+                action_server = ThreadingTCPServer((bind_ip, self.action_port), ActionTCPHandler)
+                action_server.device = self  # type: ignore[attr-defined]
+                log_server = ThreadingTCPServer((bind_ip, self.log_port), LogTCPHandler)
+                log_server.device = self  # type: ignore[attr-defined]
+            except OSError as exc:
+                print(f"[net] failed to bind TCP servers on {bind_ip}:{self.action_port}/{self.log_port}: {exc}")
+                return
+            self._action_server = action_server
+            self._log_server = log_server
+            self.bind_host = bind_ip
+            threading.Thread(target=action_server.serve_forever, daemon=True).start()
+            threading.Thread(target=log_server.serve_forever, daemon=True).start()
+
+    def _stop_tcp_servers(self) -> None:
+        with self._servers_lock:
+            if self._action_server:
+                self._action_server.shutdown()
+                self._action_server = None
+            if self._log_server:
+                self._log_server.shutdown()
+                self._log_server = None
+
+    def _restart_tcp_servers(self, bind_ip: str) -> None:
+        self._stop_tcp_servers()
+        self._start_tcp_servers(bind_ip)
 
     def post_ping_loop(self) -> None:
         last_wait_log = 0.0
@@ -379,17 +423,8 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def serve_device(device: Device) -> None:
-    try:
-        action_server = ThreadingTCPServer((device.bind_host, device.action_port), ActionTCPHandler)
-        action_server.device = device  # type: ignore[attr-defined]
-        log_server = ThreadingTCPServer((device.bind_host, device.log_port), LogTCPHandler)
-        log_server.device = device  # type: ignore[attr-defined]
-    except OSError as exc:
-        print(f"[net] failed to bind TCP servers on {device.bind_host}:{device.action_port}/{device.log_port}: {exc}")
-        raise
-
-    threading.Thread(target=action_server.serve_forever, daemon=True).start()
-    threading.Thread(target=log_server.serve_forever, daemon=True).start()
+    if device.reported_ip:
+        device._start_tcp_servers(device.bind_host)
     threading.Thread(target=device.post_ping_loop, daemon=True).start()
 
 
