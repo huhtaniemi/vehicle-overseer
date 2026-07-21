@@ -413,9 +413,11 @@
       node.ipBtn.onclick = () => openSelector(entry.uid);
       node.logBtn.onclick = () => connectLogs(entry.uid);
       const isOnline = entry.status === 'online';
-      node.ipBtn.style.display = isOnline ? 'inline-block' : 'none';
-      node.logBtn.style.display = isOnline ? 'inline-block' : 'none';
-      node.controls.style.display = isOnline ? 'flex' : 'none';
+      const hasActionPort = !!(entry.data && entry.data.actionPort);
+      const hasLogPort = !!(entry.data && entry.data.logPort);
+      node.ipBtn.style.display = (isOnline && hasActionPort) ? 'inline-block' : 'none';
+      node.logBtn.style.display = (isOnline && hasLogPort) ? 'inline-block' : 'none';
+      node.controls.style.display = (isOnline && (hasActionPort || hasLogPort)) ? 'flex' : 'none';
       if (entry.lastError) {
         node.statusEl.innerHTML = `<span class="error-pill" style="margin-left:8px;">${entry.lastError}</span>`;
       } else if (stageMsg) {
