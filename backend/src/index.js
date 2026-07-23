@@ -212,12 +212,10 @@ async function main() {
   // In-memory live state of entries
   const entries = new Map();
   const devicePingIntervalS = resolvePositiveNumber(
-    process.env.VO_DEVICE_PING_INTERVAL_S ??
-      config.devicePingIntervalS ??
-      config.pingIntervalS,
+    config.devicePingIntervalS ?? config.pingIntervalS,
     10
   );
-  const serviceLogSince = (process.env.VO_SERVICE_LOG_SINCE ?? config.defaultServiceLogSince ?? '').trim();
+  const serviceLogSince = (config.defaultServiceLogSince ?? '').trim();
   const OFFLINE_TIMEOUT_MS = Math.round((devicePingIntervalS + 2) * 1000);
   const deviceActionPort = config.deviceActionPort;
   const deviceLogPort = config.deviceLogPort;
@@ -1006,8 +1004,8 @@ const logServer = new WebSocketServer({ noServer: true });
     });
   }, 1000);
 
-  const host = process.env.VO_HTTP_HOST || config.httpHost || '127.0.0.1';
-  const port = Number(process.env.VO_HTTP_PORT || config.httpPort || 8080);
+  const host = config.httpHost || '127.0.0.1';
+  const port = Number(config.httpPort || 8080);
   server.listen(port, host, () => {
     console.log(`Backend listening on ${host}:${port}`);
     console.log('HTTP endpoints: GET /api/config, GET /api/entries, POST /api/ping, POST /api/action/select, GET /api/device/manifest, GET /api/device/artifacts/<id>, GET /api/device/key, POST /api/bootstrap-token');
