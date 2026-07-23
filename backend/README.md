@@ -16,6 +16,7 @@ Example config.json
 	"httpPort": 3100,
 	"defaultSshUser": "user",
 	"defaultServiceName": "usrapp.service",
+	"defaultServiceLogSince": "5 minutes ago", // or ' -5m'
 	"defaultMqttKey": "mqttServerIp",
 	"deviceActionPort": 9000,
 	"deviceLogPort": 9100,

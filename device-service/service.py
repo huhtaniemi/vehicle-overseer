@@ -4,9 +4,9 @@ Single-device pinger service.
 
 - Waits for network/VPN interface (default: tun0) to have an IPv4 address.
 - Posts periodic status pings to the backend (/api/ping).
-- Listens for per-action TCP connections from the backend (backend -> device) and returns
+- Listens for per-action connections from the backend (backend -> device) and returns
   only final success or error.
-- Exposes a TCP log stream endpoint that the backend can proxy to the UI.
+- Exposes a service log stream endpoint that the backend can proxy to the UI.
 """
 
 from __future__ import annotations
@@ -218,6 +218,7 @@ class Device:
                 },
             }
             for listener in self._listeners:
+                # should be redesigned..
                 if listener.kind == "action":
                     data["actionPort"] = listener.port
                 elif listener.kind == "log":
@@ -487,16 +488,23 @@ class ActionTcpService(TcpService):
 
 
 class LogTcpService(TcpService):
-    def __init__(self, runtime: DeviceRuntime, port: int) -> None:
+    def __init__(self, runtime: DeviceRuntime, port: int, service_name: str, service_log_since: str) -> None:
         super().__init__(runtime, "log", port)
+        self.service_name = service_name.strip()
+        self.service_log_since = service_log_since.strip()
 
     def handle_client(self, client: socket.socket) -> None:
         peer = f"{client.getpeername()[0]}:{client.getpeername()[1]}"
         print(f"[log] client connected: {peer}")
         journalctl_proc = None
         try:
+            cmd = ["journalctl", "-f", "--output=cat", "--no-pager"]
+            if self.service_name:
+                cmd.extend(["-u", self.service_name])
+            if self.service_log_since:
+                cmd.extend(["--since", self.service_log_since])
             journalctl_proc = subprocess.Popen(
-                ["journalctl", "--since", "1 hour ago", "-f", "--output=cat", "--no-pager"],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
@@ -581,7 +589,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     device.add_listener(ActionTcpService(runtime, args.action_port, jsonpath, mqtt_key, args.service_name))
-    device.add_listener(LogTcpService(runtime, args.log_port))
+    device.add_listener(LogTcpService(runtime, args.log_port, args.service_name, args.service_log_since))
 
     try:
         device.start()
@@ -611,10 +619,15 @@ def main() -> None:
     common.add_argument(
         "--service-name",
         default=os.environ.get("VO_SERVICE_NAME") or "",
-        help="Optional systemd unit name to restart after applying selection (or set VO_SERVICE_NAME). If empty, restart is skipped.",
+        help="Systemd unit name for action restart and optional service-log filtering",
     )
     common.add_argument("--action-port", type=int, default=int(os.environ.get("VO_ACTION_PORT") or 9000), help="TCP port for action endpoint")
-    common.add_argument("--log-port", type=int, default=int(os.environ.get("VO_LOG_PORT") or 9100), help="TCP port for log endpoint")
+    common.add_argument("--log-port", type=int, default=int(os.environ.get("VO_LOG_PORT") or 9100), help="TCP port for service log endpoint")
+    common.add_argument(
+        "--service-log-since",
+        default=os.environ.get("VO_SERVICE_LOG_SINCE") or "",
+        help="journalctl --since value for service log stream history",
+    )
     common.add_argument(
         "--bind-host",
         default=os.environ.get("VO_BIND_HOST") or "auto",

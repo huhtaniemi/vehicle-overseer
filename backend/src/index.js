@@ -32,6 +32,7 @@ async function main() {
     httpPort: 3100,
     defaultSshUser: null,
     defaultServiceName: null,
+    defaultServiceLogSince: '-1m',
     defaultMqttKey: 'mqttServerIp',
     deviceActionPort: 9000,
     deviceLogPort: 9100,
@@ -216,6 +217,7 @@ async function main() {
       config.pingIntervalS,
     10
   );
+  const serviceLogSince = (process.env.VO_SERVICE_LOG_SINCE ?? config.defaultServiceLogSince ?? '').trim();
   const OFFLINE_TIMEOUT_MS = Math.round((devicePingIntervalS + 2) * 1000);
   const deviceActionPort = config.deviceActionPort;
   const deviceLogPort = config.deviceLogPort;
@@ -548,6 +550,7 @@ async function main() {
             `VO_WAIT_TIMEOUT_S=0`,
             `VO_ACTION_PORT=${actionPort}`,
             `VO_LOG_PORT=${logPort}`,
+            `VO_SERVICE_LOG_SINCE=${JSON.stringify(serviceLogSince)}`,
             `VO_JSONPATH=/opt/${label}/properties.json`,
             `VO_MQTT_KEY=${config.defaultMqttKey}`,
             `VO_PING_INTERVAL_S=${pingIntervalS}`,
