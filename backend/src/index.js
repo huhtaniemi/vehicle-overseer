@@ -59,7 +59,7 @@ async function main() {
 
   const ensureArtifactsInsertedAtColumn = async () => {
     const SQL = await initSqlJs({ locateFile: locateSqlFile });
-    const dbPathResolved = path.resolve(rootDir, config.dbPath || './data/vehicle_overseer.sqlite');
+    const dbPathResolved = path.resolve(rootDir, config.dbPath);
     const schemaPath = path.resolve(rootDir, 'schema.sql');
     const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
     const db = fs.existsSync(dbPathResolved)
@@ -130,7 +130,7 @@ async function main() {
   });
   */
   const SQL = await initSqlJs({ locateFile: locateSqlFile });
-  const dbPath = path.resolve(rootDir, config.dbPath || './data/vehicle_overseer.sqlite');
+  const dbPath = path.resolve(rootDir, config.dbPath);
   let db;
   if (fs.existsSync(dbPath)) {
     db = new SQL.Database(fs.readFileSync(dbPath));
@@ -211,11 +211,8 @@ async function main() {
 
   // In-memory live state of entries
   const entries = new Map();
-  const devicePingIntervalS = resolvePositiveNumber(
-    config.devicePingIntervalS ?? config.pingIntervalS,
-    10
-  );
-  const serviceLogSince = (config.defaultServiceLogSince ?? '').trim();
+  const devicePingIntervalS = resolvePositiveNumber(config.devicePingIntervalS, 10);
+  const serviceLogSince = config.defaultServiceLogSince;
   const OFFLINE_TIMEOUT_MS = Math.round((devicePingIntervalS + 2) * 1000);
   const deviceActionPort = config.deviceActionPort;
   const deviceLogPort = config.deviceLogPort;
@@ -1004,8 +1001,8 @@ const logServer = new WebSocketServer({ noServer: true });
     });
   }, 1000);
 
-  const host = config.httpHost || '127.0.0.1';
-  const port = Number(config.httpPort || 8080);
+  const host = config.httpHost;
+  const port = Number(config.httpPort);
   server.listen(port, host, () => {
     console.log(`Backend listening on ${host}:${port}`);
     console.log('HTTP endpoints: GET /api/config, GET /api/entries, POST /api/ping, POST /api/action/select, GET /api/device/manifest, GET /api/device/artifacts/<id>, GET /api/device/key, POST /api/bootstrap-token');
