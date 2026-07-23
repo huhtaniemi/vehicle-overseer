@@ -36,7 +36,11 @@ chmod 0644 "$UNIT_DST"
 
 if [ "$NO_SYSTEMD" -eq 0 ]; then
 	systemctl daemon-reload || log "warn: systemctl daemon-reload failed"
-	systemctl enable --now vehicle-overseer.service || log "warn: failed to enable vehicle-overseer.service"
+	if systemctl enable vehicle-overseer.service; then
+		systemctl restart vehicle-overseer.service || log "warn: failed to restart vehicle-overseer.service"
+	else
+		log "warn: failed to enable vehicle-overseer.service"
+	fi
 else
 	log "systemd unavailable; unit file copied but not enabled"
 fi
