@@ -609,7 +609,7 @@ def main() -> None:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--backend", default=os.environ.get("VO_BACKEND") or "http://localhost:3100", help="Backend base URL")
-    common.add_argument("--uid", default=os.environ.get("VO_DEVICE_UID"), help="Device UID to report")
+    common.add_argument("--uid", default=None, help="Device UID to report, explicit override")
     common.add_argument(
         "--uid-path",
         default=os.environ.get("VO_DEVICE_UID_PATH", "/etc/vehicle-overseer/device.uid"),
@@ -640,7 +640,7 @@ def main() -> None:
     )
     common.add_argument(
         "--report-ip-override",
-        default=os.environ.get("VO_REPORT_IP_OVERRIDE"),
+        default=None,
         help="Override reported ip-address for test environments",
     )
     common.add_argument(

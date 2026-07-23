@@ -107,7 +107,7 @@ The refresh command:
   - Example:
     - `curl -sS -X POST http://127.0.0.1:3100/api/bootstrap-token -H 'Content-Type: application/json' -d '{"kind":"dev"}'`
 - The updater requires `VO_ARTIFACT_KEY_PATH` and requests encrypted downloads by adding `?uid=DEVICE_UID` to the artifact URL; backend responds with `X-VO-Enc: aes-256-ctr` + `X-VO-Iv: ...`.
-- Device UID can be provided via `VO_DEVICE_UID` or a file at `/etc/vehicle-overseer/device.uid` (override with `VO_DEVICE_UID_PATH`).
+- Device UID is read from `/etc/vehicle-overseer/device.uid` by default (override the path with `VO_DEVICE_UID_PATH` or pass `--device-uid` explicitly for testing/manual runs).
 - The updater swaps `app/` to `app.bak/`, installs the new app, runs `update.sh`, then removes `app.bak/` on success.
 - Device can report per-device ports in `POST /api/ping` (`data.actionPort`, `data.logPort`); backend prefers these over global defaults when present.
 - Service version info is reported in `POST /api/ping` as `data.version` (e.g. `serviceVersion`).

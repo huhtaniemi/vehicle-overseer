@@ -194,9 +194,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
         or _env("VO_DEVICE_UID_PATH")
         or "/etc/vehicle-overseer/device.uid"
     )
-    device_uid = args.device_uid or _env("VO_DEVICE_UID") or _read_text(uid_path)
+    device_uid = args.device_uid or _read_text(uid_path)
     if artifact_key is not None and not device_uid:
-        raise ValueError("artifact key configured but no VO_DEVICE_UID provided")
+        raise ValueError("artifact key configured but no device UID available")
     log(f"deviceUidPath={uid_path}")
     if not device_uid:
         raise ValueError("device UID required to fetch manifest")
@@ -349,8 +349,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--device-uid",
-        default=_env("VO_DEVICE_UID"),
-        help="Device UID for encrypted artifact downloads (or set VO_DEVICE_UID)",
+        default=None,
+        help="Device UID for encrypted artifact downloads (explicit override)",
     )
     parser.add_argument(
         "--device-uid-path",
