@@ -19,7 +19,6 @@ import os
 import select
 import signal
 import socket
-import socketserver
 import subprocess
 import sys
 import threading
@@ -39,30 +38,6 @@ def post_json(url: str, payload: dict) -> None:
         resp.read()
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, check=True, text=True, capture_output=True)
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
 def _read_text(path: str) -> str | None:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -72,7 +47,7 @@ def _read_text(path: str) -> str | None:
 
 
 def _iface_ipv4_addrs(iface: str) -> list[ipaddress.IPv4Interface]:
-    out = _run(["ip", "-o", "-f", "inet", "addr", "show", "dev", iface]).stdout
+    out = subprocess.run(["ip", "-o", "-f", "inet", "addr", "show", "dev", iface], check=True, text=True, capture_output=True).stdout
     addrs: list[ipaddress.IPv4Interface] = []
     for line in out.splitlines():
         m = re.search(r"\sinet\s+(\d+\.\d+\.\d+\.\d+/\d+)\s", line)
@@ -113,40 +88,38 @@ def wait_for_iface_ipv4(iface: str, timeout_s: float) -> str:
         time.sleep(1)
 
 
+class DeviceRuntime:
+    def __init__(self, stop_event: threading.Event, retry_s: float) -> None:
+        self.stop_event = stop_event
+        self.stopping = threading.Event()
+        self.retry_delay_s = retry_s
+        self.bind_host: str | None = None
+
+
 class Device:
     def __init__(
         self,
+        runtime: DeviceRuntime,
         uid: str,
         label: str,
         backend_base: str,
-        reported_ip: str,
         bind_host: str,
-        action_port: int,
-        log_port: int,
         ping_interval_s: float,
-        jsonpath: str,
-        mqtt_key: str,
         report_iface: str | None,
-        service_name: str,
+        wait_timeout_s: float,
     ) -> None:
+        self._runtime = runtime
+        self._threads: list[threading.Thread] = []
+        self._listeners: list[TcpService] = []
+        self._service_version = self._read_service_version()
         self.uid = uid
         self.label = label
         self.backend_base = backend_base.rstrip("/")
-        self.reported_ip: str | None = reported_ip
+        self.reported_ip: str | None = None
         self.bind_host = bind_host
-        self.action_port = action_port
-        self.log_port = log_port
         self.ping_interval_s = ping_interval_s
-        self.jsonpath = jsonpath
-        self.mqtt_key = mqtt_key
         self.report_iface = report_iface
-        self._action_count = 0
-        self._lock = threading.Lock()
-        self._service_version = self._read_service_version()
-        self.service_name = service_name
-        self._action_server: ThreadingTCPServer | None = None
-        self._log_server: ThreadingTCPServer | None = None
-        self._servers_lock = threading.Lock()
+        self.wait_timeout_s = wait_timeout_s
 
     def _read_service_version(self) -> str | None:
         base = os.path.dirname(os.path.abspath(__file__))
@@ -159,56 +132,75 @@ class Device:
                 continue
         return None
 
+    def start(self) -> None:
+        if self.report_iface:
+            self.reported_ip = wait_for_iface_ipv4(self.report_iface, self.wait_timeout_s)
+        self._runtime.bind_host = self._effective_bind_host()
+        for listener in self._listeners:
+            listener.ensure_started(force=True)
+        self._start_thread(self.post_ping_loop)
+        self._start_thread(self.listener_supervisor_loop)
+
+    def add_listener(self, listener: TcpService) -> None:
+        self._listeners.append(listener)
+
+    def _start_thread(self, target) -> None:  # type: ignore[no-untyped-def]
+        thread = threading.Thread(target=target, daemon=True)
+        self._threads.append(thread)
+        thread.start()
+
+    def _bind_host_is_dynamic(self) -> bool:
+        return self.bind_host in {"", "auto", "reported"}
+
+    def _effective_bind_host(self) -> str | None:
+        if self._bind_host_is_dynamic():
+            return self.reported_ip
+        return self.bind_host
+
     def _refresh_reported_ip_if_needed(self) -> None:
         if not self.report_iface:
             return
         current = _iface_first_ipv4(self.report_iface)
+        if current == self.reported_ip:
+            return
+
         old_ip = self.reported_ip
         self.reported_ip = current
+        self._runtime.bind_host = self._effective_bind_host()
+        if not self._bind_host_is_dynamic():
+            return
+        if current is None:
+            print(f"[net] {self.report_iface!r} lost IPv4 address")
+            for listener in self._listeners:
+                listener.stop()
+            return
+        if old_ip is None:
+            print(f"[net] {self.report_iface!r} IPv4 acquired {current}; starting TCP servers")
+        else:
+            print(f"[net] {self.report_iface!r} IPv4 changed {old_ip} -> {current}; rebinding TCP servers")
+        for listener in self._listeners:
+            listener.restart()
 
-        if current != old_ip:
-            if current is None:
-                print(f"[net] {self.report_iface!r} lost IPv4 address; stopping TCP servers")
-                self._stop_tcp_servers()
-            else:
-                if old_ip is not None:
-                    print(f"[net] {self.report_iface!r} IPv4 changed {old_ip} -> {current}; rebinding TCP servers")
-                else:
-                    print(f"[net] {self.report_iface!r} IPv4 acquired {current}; starting TCP servers")
-                self._restart_tcp_servers(current)
+    def listener_supervisor_loop(self) -> None:
+        while not self._runtime.stop_event.wait(1.0):
+            for listener in self._listeners:
+                listener.ensure_started()
 
-    def _start_tcp_servers(self, bind_ip: str) -> None:
-        with self._servers_lock:
-            try:
-                action_server = ThreadingTCPServer((bind_ip, self.action_port), ActionTCPHandler)
-                action_server.device = self  # type: ignore[attr-defined]
-                log_server = ThreadingTCPServer((bind_ip, self.log_port), LogTCPHandler)
-                log_server.device = self  # type: ignore[attr-defined]
-            except OSError as exc:
-                print(f"[net] failed to bind TCP servers on {bind_ip}:{self.action_port}/{self.log_port}: {exc}")
-                return
-            self._action_server = action_server
-            self._log_server = log_server
-            self.bind_host = bind_ip
-            threading.Thread(target=action_server.serve_forever, daemon=True).start()
-            threading.Thread(target=log_server.serve_forever, daemon=True).start()
-
-    def _stop_tcp_servers(self) -> None:
-        with self._servers_lock:
-            if self._action_server:
-                self._action_server.shutdown()
-                self._action_server = None
-            if self._log_server:
-                self._log_server.shutdown()
-                self._log_server = None
-
-    def _restart_tcp_servers(self, bind_ip: str) -> None:
-        self._stop_tcp_servers()
-        self._start_tcp_servers(bind_ip)
+    def shutdown(self) -> None:
+        if self._runtime.stopping.is_set():
+            return
+        self._runtime.stopping.set()
+        self._runtime.stop_event.set()
+        for listener in self._listeners:
+            listener.stop()
+        current = threading.current_thread()
+        for thread in self._threads:
+            if thread is not current:
+                thread.join(timeout=2)
 
     def post_ping_loop(self) -> None:
         last_wait_log = 0.0
-        while True:
+        while not self._runtime.stop_event.is_set():
             if self.report_iface:
                 self._refresh_reported_ip_if_needed()
                 if not self.reported_ip:
@@ -216,44 +208,181 @@ class Device:
                     if now - last_wait_log >= 5:
                         print(f"[net] {self.report_iface!r} has no IPv4 address yet; delaying POST ping")
                         last_wait_log = now
-                    time.sleep(1)
+                    if self._runtime.stop_event.wait(1.0):
+                        break
                     continue
+
+            data: dict[str, object] = {
+                "version": {
+                    "serviceVersion": self._service_version,
+                },
+            }
+            for listener in self._listeners:
+                if listener.kind == "action":
+                    data["actionPort"] = listener.port
+                elif listener.kind == "log":
+                    data["logPort"] = listener.port
 
             payload = {
                 "uid": self.uid,
                 "label": self.label,
                 "ip-address": self.reported_ip,
                 "state": "not implemented",
-                "data": {
-                    "actionPort": self.action_port,
-                    "logPort": self.log_port,
-                    "version": {
-                        "serviceVersion": self._service_version,
-                    },
-                },
+                "data": data,
             }
 
             try:
                 post_json(f"{self.backend_base}/api/ping", payload)
             except Exception as exc:
                 print(f"[{self.label}] ping failed: {exc}")
-            time.sleep(self.ping_interval_s)
+            if self._runtime.stop_event.wait(self.ping_interval_s):
+                break
+
+
+class TcpService:
+    def __init__(self, runtime: DeviceRuntime, kind: str, port: int) -> None:
+        self.runtime = runtime
+        self.kind = kind
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._client_sockets: list[socket.socket] = []
+        self._client_threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._retry_at = 0.0
+
+    def _delay_retry(self, now: float | None = None) -> None:
+        self._retry_at = (now if now is not None else time.monotonic()) + self.runtime.retry_delay_s
+
+    def ensure_started(self, *, force: bool = False) -> bool:
+        bind_ip = self.runtime.bind_host
+        if not bind_ip:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            if self.runtime.stopping.is_set():
+                return False
+            if self._sock is not None:
+                return True
+            if not force and now < self._retry_at:
+                return False
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((bind_ip, self.port))
+                sock.listen()
+                sock.settimeout(1.0)
+            except OSError as exc:
+                self._delay_retry(now)
+                print(f"[net] failed to bind {self.kind} TCP server on {bind_ip}:{self.port}: {exc}; retrying in {int(self.runtime.retry_delay_s)}s")
+                return False
+            thread = threading.Thread(target=self._serve, args=(sock,), daemon=True)
+            self._sock = sock
+            self._thread = thread
+            self._retry_at = 0.0
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            with self._lock:
+                if self._sock is sock:
+                    self._sock = None
+                    self._thread = None
+                self._delay_retry()
+            sock.close()
+            print(f"[net] failed to start {self.kind} TCP server thread: {exc}; retrying in {int(self.runtime.retry_delay_s)}s")
+            return False
+        return True
+
+    def _serve(self, sock: socket.socket) -> None:
+        unexpected = False
+        try:
+            while not self.runtime.stop_event.is_set():
+                try:
+                    client, _peer = sock.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                thread = threading.Thread(target=self._handle_client, args=(client,), daemon=False)
+                with self._lock:
+                    self._client_sockets.append(client)
+                    self._client_threads.append(thread)
+                thread.start()
+        except Exception as exc:
+            unexpected = True
+            print(f"[net] {self.kind} TCP server crashed: {exc}")
+        finally:
+            should_retry = False
+            with self._lock:
+                if self._sock is sock:
+                    self._sock = None
+                    self._thread = None
+                if unexpected and not self.runtime.stopping.is_set():
+                    self._delay_retry()
+                    should_retry = True
+            sock.close()
+            if should_retry:
+                print(f"[net] {self.kind} TCP server stopped; retrying in {int(self.runtime.retry_delay_s)}s")
+
+    def _handle_client(self, client: socket.socket) -> None:
+        try:
+            self.handle_client(client)
+        finally:
+            try:
+                client.close()
+            finally:
+                current = threading.current_thread()
+                with self._lock:
+                    self._client_sockets = [sock for sock in self._client_sockets if sock is not client]
+                    self._client_threads = [thread for thread in self._client_threads if thread is not current]
+
+    def restart(self) -> None:
+        self.stop()
+        self.ensure_started(force=True)
+
+    def stop(self) -> None:
+        with self._lock:
+            sock = self._sock
+            thread = self._thread
+            client_sockets = list(self._client_sockets)
+            self._sock = None
+            self._thread = None
+        if sock is not None:
+            sock.close()
+        for client_socket in client_sockets:
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client_socket.close()
+        if thread is not None:
+            thread.join(timeout=2)
+        with self._lock:
+            client_threads = list(self._client_threads)
+        for client_thread in client_threads:
+            client_thread.join(timeout=2)
+
+    def handle_client(self, client: socket.socket) -> None:
+        raise NotImplementedError()
+
+
+class ActionTcpService(TcpService):
+    def __init__(self, runtime: DeviceRuntime, port: int, jsonpath: str, mqtt_key: str, service_name: str) -> None:
+        super().__init__(runtime, "action", port)
+        self.jsonpath = jsonpath
+        self.mqtt_key = mqtt_key
+        self.service_name = service_name
+        self._action_lock = threading.Lock()
 
     def _replace_mqtt_value(self, current: str, requested_ip: str) -> str:
         requested = requested_ip.strip()
-        if not requested:
-            return requested
-        if "://" in requested:
+        if not requested or "://" in requested:
             return requested
         if ":" in requested:
             scheme = re.match(r"^[^:]+://", current)
-            if scheme:
-                return f"{scheme.group(0)}{requested}"
-            return requested
+            return f"{scheme.group(0)}{requested}" if scheme else requested
         match = re.match(r"^(?P<prefix>[^:]+://)?(?P<host>[^:/]+)(?P<suffix>.*)$", current)
-        if match:
-            return f"{match.group('prefix') or ''}{requested}{match.group('suffix')}"
-        return requested
+        return f"{match.group('prefix') or ''}{requested}{match.group('suffix')}" if match else requested
 
     def _find_key_paths(self, data: object, key: str) -> list[list[str]]:
         paths: list[list[str]] = []
@@ -261,10 +390,10 @@ class Device:
         def walk(obj: object, prefix: list[str]) -> None:
             if isinstance(obj, dict):
                 for k, v in obj.items():
-                    next_prefix = prefix + [k]
+                    path = prefix + [k]
                     if k == key:
-                        paths.append(next_prefix)
-                    walk(v, next_prefix)
+                        paths.append(path)
+                    walk(v, path)
             elif isinstance(obj, list):
                 for idx, item in enumerate(obj):
                     walk(item, prefix + [str(idx)])
@@ -293,12 +422,9 @@ class Device:
     def _update_properties_json(self, requested_ip: str) -> str:
         try:
             with open(self.jsonpath, "r", encoding="utf-8") as f:
-                raw = f.read()
+                data = json.load(f)
         except FileNotFoundError as exc:
             raise ValueError(f"{self.jsonpath} not found!") from exc
-
-        try:
-            data = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ValueError(f"{self.jsonpath} is invalid json: {exc}") from exc
 
@@ -311,81 +437,74 @@ class Device:
             if len(paths) > 1:
                 raise ValueError(f"mqtt key {self.mqtt_key!r} is ambiguous; use a dotted path")
             key_path = paths[0]
+
         current = self._get_by_path(data, key_path)
         if not isinstance(current, str):
             raise ValueError(f"mqtt key {self.mqtt_key!r} must be a string")
-
         new_value = self._replace_mqtt_value(current, requested_ip)
         self._set_by_path(data, key_path, new_value)
-        new_raw = json.dumps(data, indent=2) + "\n"
 
         tmp_path = f"{self.jsonpath}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(new_raw)
+            json.dump(data, f, indent=2)
+            f.write("\n")
         os.replace(tmp_path, self.jsonpath)
         return new_value
-
-    def _restart_service(self) -> None:
-        if not self.service_name:
-            return
-        subprocess.run(["systemctl", "restart", self.service_name], check=True, timeout=10)
 
     def handle_action(self, requested_ip: str) -> dict:
         if not requested_ip:
             return {"ok": False, "error": "missing ip"}
-        with self._lock:
-            self._action_count += 1
+        with self._action_lock:
             try:
                 new_value = self._update_properties_json(requested_ip)
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
 
-            if self.service_name:
-                try:
-                    self._restart_service()
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-                    return {"ok": False, "error": f"service restart failed: {exc}"}
-                restarted = True
-            else:
-                restarted = False
+            if not self.service_name:
+                return {"ok": True, "key": self.mqtt_key, "value": new_value, "restarted": False}
+            try:
+                subprocess.run(["systemctl", "restart", self.service_name], check=True, timeout=10)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                return {"ok": False, "error": f"service restart failed: {exc}"}
+            return {"ok": True, "key": self.mqtt_key, "value": new_value, "restarted": True}
 
-        return {"ok": True, "key": self.mqtt_key, "value": new_value, "restarted": restarted}
-
-
-class ActionTCPHandler(socketserver.StreamRequestHandler):
-    def handle(self) -> None:
-        device: Device = self.server.device  # type: ignore[attr-defined]
-        raw = self.rfile.readline().decode("utf-8", errors="replace").strip()
+    def handle_client(self, client: socket.socket) -> None:
+        stream = client.makefile("rwb")
+        raw = stream.readline().decode("utf-8", errors="replace").strip()
         try:
             msg = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             out = {"ok": False, "error": "invalid json"}
-            self.wfile.write((json.dumps(out) + "\n").encode("utf-8"))
+            stream.write((json.dumps(out) + "\n").encode("utf-8"))
+            stream.flush()
             return
         requested_ip = msg.get("ip", "")
-        print(f"[{device.label}] action received: ip={requested_ip!r}")
-        out = device.handle_action(requested_ip)
-        print(f"[{device.label}] action result: {out}")
-        self.wfile.write((json.dumps(out) + "\n").encode("utf-8"))
+        print(f"[action] received: ip={requested_ip!r}")
+        out = self.handle_action(requested_ip)
+        print(f"[action] result: {out}")
+        stream.write((json.dumps(out) + "\n").encode("utf-8"))
+        stream.flush()
 
 
-class LogTCPHandler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:
-        device: Device = self.server.device  # type: ignore[attr-defined]
-        peer = f"{self.client_address[0]}:{self.client_address[1]}"
-        print(f"[{device.label}] logs client connected: {peer}")
-        proc = None
+class LogTcpService(TcpService):
+    def __init__(self, runtime: DeviceRuntime, port: int) -> None:
+        super().__init__(runtime, "log", port)
+
+    def handle_client(self, client: socket.socket) -> None:
+        peer = f"{client.getpeername()[0]}:{client.getpeername()[1]}"
+        print(f"[log] client connected: {peer}")
+        journalctl_proc = None
         try:
-            proc = subprocess.Popen(
+            journalctl_proc = subprocess.Popen(
                 ["journalctl", "--since", "1 hour ago", "-f", "--output=cat", "--no-pager"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
-            assert proc.stdout is not None
-            stdout_fd = proc.stdout.fileno()
+            assert journalctl_proc.stdout is not None
+            stdout_fd = journalctl_proc.stdout.fileno()
             peek_flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
             while True:
-                if proc.poll() is not None:
+                if journalctl_proc.poll() is not None:
                     break
                 ready, _, _ = select.select([stdout_fd], [], [], 1.0)
                 if ready:
@@ -393,12 +512,12 @@ class LogTCPHandler(socketserver.BaseRequestHandler):
                     if not chunk:
                         break
                     try:
-                        self.request.sendall(chunk)
+                        client.sendall(chunk)
                     except (BrokenPipeError, ConnectionResetError):
                         break
                     continue
                 try:
-                    peek = self.request.recv(1, peek_flags)
+                    peek = client.recv(1, peek_flags)
                     if peek == b"":
                         break
                 except BlockingIOError:
@@ -406,53 +525,32 @@ class LogTCPHandler(socketserver.BaseRequestHandler):
                 except (ConnectionResetError, OSError):
                     break
         except FileNotFoundError:
-            self.request.sendall(b"[log] journalctl not found\n")
+            client.sendall(b"[log] journalctl not found\n")
         finally:
-            if proc and proc.poll() is None:
-                proc.terminate()
+            if journalctl_proc and journalctl_proc.poll() is None:
+                journalctl_proc.terminate()
                 try:
-                    proc.wait(timeout=2)
+                    journalctl_proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-            print(f"[{device.label}] logs client disconnected: {peer}")
-
-
-class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-def serve_device(device: Device) -> None:
-    if device.reported_ip:
-        device._start_tcp_servers(device.bind_host)
-    threading.Thread(target=device.post_ping_loop, daemon=True).start()
-
-
-def _handle_exit(signum: int, _frame) -> None:  # type: ignore[no-untyped-def]
-    raise KeyboardInterrupt
+                    journalctl_proc.kill()
+                    journalctl_proc.wait(timeout=2)
+            print(f"[log] client disconnected: {peer}")
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    report_iface = None if args.report_ip else args.report_iface
+    global _iface_first_ipv4
+
+    stop_event = threading.Event()
+    runtime = DeviceRuntime(stop_event, 60.0)
+
+    def _handle_exit(signum: int, _frame) -> None:  # type: ignore[no-untyped-def]
+        del signum
+        stop_event.set()
 
     device_uid = args.uid or _read_text(args.uid_path)
     if not device_uid:
         print("Device UID is required")
         return 2
-
-    if args.report_ip:
-        reported_ip = args.report_ip
-    else:
-        try:
-            reported_ip = wait_for_iface_ipv4(args.report_iface, args.wait_timeout_s)
-        except TimeoutError as exc:
-            print(f"[net] {exc}")
-            return 2
-
-    if args.bind_host in {"auto", "reported", ""}:
-        bind_host = reported_ip
-    else:
-        bind_host = args.bind_host
 
     label = args.label
     if not args.jsonpath:
@@ -461,33 +559,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     jsonpath = args.jsonpath
     mqtt_key = args.mqtt_key
     print(
-        f"Device starting uid={device_uid!r} label={label!r} -> {args.backend} (ip-address {reported_ip}, bind {bind_host}, jsonpath {jsonpath})"
+        f"Device starting uid={device_uid!r} label={label!r} -> {args.backend} (iface {args.report_iface}, bind {args.bind_host}, jsonpath {jsonpath})"
     )
 
     signal.signal(signal.SIGINT, _handle_exit)
     signal.signal(signal.SIGTERM, _handle_exit)
 
+    if args.report_ip_override:
+        report_ip_override = str(ipaddress.ip_interface(args.report_ip_override).ip)
+        _iface_first_ipv4 = lambda iface: report_ip_override
+
+    device = Device(
+        runtime=runtime,
+        uid=device_uid,
+        label=label,
+        backend_base=args.backend,
+        bind_host=args.bind_host,
+        ping_interval_s=args.ping_interval_s,
+        report_iface=args.report_iface,
+        wait_timeout_s=args.wait_timeout_s,
+    )
+
+    device.add_listener(ActionTcpService(runtime, args.action_port, jsonpath, mqtt_key, args.service_name))
+    device.add_listener(LogTcpService(runtime, args.log_port))
+
     try:
-        device = Device(
-            uid=device_uid,
-            label=label,
-            backend_base=args.backend,
-            reported_ip=reported_ip,
-            bind_host=bind_host,
-            action_port=args.action_port,
-            log_port=args.log_port,
-            ping_interval_s=args.ping_interval_s,
-            jsonpath=jsonpath,
-            mqtt_key=mqtt_key,
-            report_iface=report_iface,
-            service_name=args.service_name,
-        )
-        serve_device(device)
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        print("Device exiting")
-        return 0
+        device.start()
+        stop_event.wait()
+    except TimeoutError as exc:
+        print(f"[net] {exc}")
+        return 2
+    finally:
+        device.shutdown()
+    print("Device exiting")
+    return 0
 
 
 def main() -> None:
@@ -508,8 +613,8 @@ def main() -> None:
         default=os.environ.get("VO_SERVICE_NAME") or "",
         help="Optional systemd unit name to restart after applying selection (or set VO_SERVICE_NAME). If empty, restart is skipped.",
     )
-    common.add_argument("--action-port", type=int, default=_env_int("VO_ACTION_PORT", 9000), help="TCP port for action endpoint")
-    common.add_argument("--log-port", type=int, default=_env_int("VO_LOG_PORT", 9100), help="TCP port for log endpoint")
+    common.add_argument("--action-port", type=int, default=int(os.environ.get("VO_ACTION_PORT") or 9000), help="TCP port for action endpoint")
+    common.add_argument("--log-port", type=int, default=int(os.environ.get("VO_LOG_PORT") or 9100), help="TCP port for log endpoint")
     common.add_argument(
         "--bind-host",
         default=os.environ.get("VO_BIND_HOST") or "auto",
@@ -520,17 +625,21 @@ def main() -> None:
         default=os.environ.get("VO_REPORT_IFACE") or "tun0",
         help="Interface whose IPv4 address is reported as ip-address",
     )
-    common.add_argument("--report-ip", default=None, help="Override reported ip-address (skips iface wait)")
+    common.add_argument(
+        "--report-ip-override",
+        default=os.environ.get("VO_REPORT_IP_OVERRIDE"),
+        help="Override reported ip-address for test environments",
+    )
     common.add_argument(
         "--wait-timeout-s",
         type=float,
-        default=_env_float("VO_WAIT_TIMEOUT_S", 0.0),
+        default=float(os.environ.get("VO_WAIT_TIMEOUT_S") or 0.0),
         help="Seconds to wait for report-iface to get an IPv4 address (0 = forever)",
     )
     common.add_argument(
         "--ping-interval-s",
         type=float,
-        default=_env_float("VO_PING_INTERVAL_S", 10.0),
+        default=float(os.environ.get("VO_PING_INTERVAL_S") or 10.0),
         help="POST ping interval in seconds",
     )
     common.add_argument(
