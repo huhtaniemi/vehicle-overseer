@@ -19,6 +19,7 @@ import os
 import select
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -218,11 +219,7 @@ class Device:
                 },
             }
             for listener in self._listeners:
-                # should be redesigned..
-                if listener.kind == "action":
-                    data["actionPort"] = listener.port
-                elif listener.kind == "log":
-                    data["logPort"] = listener.port
+                data[listener.kind+"Port"] = listener.port
 
             payload = {
                 "uid": self.uid,
@@ -240,15 +237,27 @@ class Device:
                 break
 
 
+class _TcpRequestHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        self.server.service.handle_client(self.request)  # type: ignore[attr-defined]
+
+
+class _ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], service: "TcpService") -> None:
+        self.service = service
+        super().__init__(address, _TcpRequestHandler)
+
+
 class TcpService:
     def __init__(self, runtime: DeviceRuntime, kind: str, port: int) -> None:
         self.runtime = runtime
         self.kind = kind
         self.port = port
-        self._sock: socket.socket | None = None
+        self._server: _ThreadingTcpServer | None = None
         self._thread: threading.Thread | None = None
-        self._client_sockets: list[socket.socket] = []
-        self._client_threads: list[threading.Thread] = []
         self._lock = threading.Lock()
         self._retry_at = 0.0
 
@@ -263,79 +272,52 @@ class TcpService:
         with self._lock:
             if self.runtime.stopping.is_set():
                 return False
-            if self._sock is not None:
+            if self._server is not None:
                 return True
             if not force and now < self._retry_at:
                 return False
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((bind_ip, self.port))
-                sock.listen()
-                sock.settimeout(1.0)
+                server = _ThreadingTcpServer((bind_ip, self.port), self)
             except OSError as exc:
                 self._delay_retry(now)
                 print(f"[net] failed to bind {self.kind} TCP server on {bind_ip}:{self.port}: {exc}; retrying in {int(self.runtime.retry_delay_s)}s")
                 return False
-            thread = threading.Thread(target=self._serve, args=(sock,), daemon=True)
-            self._sock = sock
+            thread = threading.Thread(target=self._serve, args=(server,), daemon=True)
+            self._server = server
             self._thread = thread
             self._retry_at = 0.0
         try:
             thread.start()
         except RuntimeError as exc:
             with self._lock:
-                if self._sock is sock:
-                    self._sock = None
+                if self._server is server:
+                    self._server = None
                     self._thread = None
                 self._delay_retry()
-            sock.close()
+            server.server_close()
             print(f"[net] failed to start {self.kind} TCP server thread: {exc}; retrying in {int(self.runtime.retry_delay_s)}s")
             return False
         return True
 
-    def _serve(self, sock: socket.socket) -> None:
+    def _serve(self, server: _ThreadingTcpServer) -> None:
         unexpected = False
         try:
-            while not self.runtime.stop_event.is_set():
-                try:
-                    client, _peer = sock.accept()
-                except TimeoutError:
-                    continue
-                except OSError:
-                    break
-                thread = threading.Thread(target=self._handle_client, args=(client,), daemon=False)
-                with self._lock:
-                    self._client_sockets.append(client)
-                    self._client_threads.append(thread)
-                thread.start()
+            server.serve_forever(poll_interval=0.5)
         except Exception as exc:
             unexpected = True
             print(f"[net] {self.kind} TCP server crashed: {exc}")
         finally:
             should_retry = False
             with self._lock:
-                if self._sock is sock:
-                    self._sock = None
+                if self._server is server:
+                    self._server = None
                     self._thread = None
                 if unexpected and not self.runtime.stopping.is_set():
                     self._delay_retry()
                     should_retry = True
-            sock.close()
+            server.server_close()
             if should_retry:
                 print(f"[net] {self.kind} TCP server stopped; retrying in {int(self.runtime.retry_delay_s)}s")
-
-    def _handle_client(self, client: socket.socket) -> None:
-        try:
-            self.handle_client(client)
-        finally:
-            try:
-                client.close()
-            finally:
-                current = threading.current_thread()
-                with self._lock:
-                    self._client_sockets = [sock for sock in self._client_sockets if sock is not client]
-                    self._client_threads = [thread for thread in self._client_threads if thread is not current]
 
     def restart(self) -> None:
         self.stop()
@@ -343,25 +325,15 @@ class TcpService:
 
     def stop(self) -> None:
         with self._lock:
-            sock = self._sock
+            server = self._server
             thread = self._thread
-            client_sockets = list(self._client_sockets)
-            self._sock = None
+            self._server = None
             self._thread = None
-        if sock is not None:
-            sock.close()
-        for client_socket in client_sockets:
-            try:
-                client_socket.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            client_socket.close()
-        if thread is not None:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
-        with self._lock:
-            client_threads = list(self._client_threads)
-        for client_thread in client_threads:
-            client_thread.join(timeout=2)
 
     def handle_client(self, client: socket.socket) -> None:
         raise NotImplementedError()
