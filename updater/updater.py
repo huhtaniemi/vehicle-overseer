@@ -160,11 +160,35 @@ def _systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["systemctl", *args], check=True, text=True, capture_output=True)
 
 
-APP_DIRNAME = "app"
-APP_BACKUP_DIRNAME = "app.bak"
 UPDATE_SCRIPT_NAME = "update.sh"
-def _run_update_script(app_dir: str, env: dict[str, str]) -> None:
-    script_path = os.path.join(app_dir, UPDATE_SCRIPT_NAME)
+
+
+def _remove_path(path: str) -> None:
+    if not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    os.unlink(path)
+
+
+def _copy_path(src: str, dst: str) -> None:
+    if os.path.isdir(src) and not os.path.islink(src):
+        shutil.copytree(src, dst, copy_function=shutil.copy2)
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _iter_install_root_entries(staging_dir: str) -> list[str]:
+    return [
+        name for name in os.listdir(staging_dir)
+        if name not in {UPDATE_SCRIPT_NAME, "VERSION"}
+    ]
+
+
+def _run_update_script(staging_dir: str, cwd: str, env: dict[str, str]) -> None:
+    script_path = os.path.join(staging_dir, UPDATE_SCRIPT_NAME)
     if not os.path.isfile(script_path):
         raise ValueError(f"missing {UPDATE_SCRIPT_NAME} in artifact")
     if os.access(script_path, os.X_OK):
@@ -175,7 +199,7 @@ def _run_update_script(app_dir: str, env: dict[str, str]) -> None:
             raise RuntimeError("no shell found to run update.sh (install bash or sh)")
         cmd = [shell, script_path]
     log(f"run {UPDATE_SCRIPT_NAME}")
-    proc = subprocess.run(cmd, cwd=app_dir, env=env)
+    proc = subprocess.run(cmd, cwd=cwd, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"{UPDATE_SCRIPT_NAME} failed (exit {proc.returncode})")
 
@@ -183,8 +207,6 @@ def _run_update_script(app_dir: str, env: dict[str, str]) -> None:
 def cmd_apply(args: argparse.Namespace) -> int:
     backend = args.backend.rstrip("/")
     install_root = args.install_root
-    app_dir = os.path.join(install_root, APP_DIRNAME)
-    backup_dir = os.path.join(install_root, APP_BACKUP_DIRNAME)
     artifact_key = _load_artifact_key(args.artifact_key_path or _env("VO_ARTIFACT_KEY_PATH"))
     if artifact_key is None:
         raise ValueError("artifact key required (artifacts are always encrypted)")
@@ -261,7 +283,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
             f"artifact size mismatch: expected {artifact_size_bytes}, got {len(blob)}"
         )
 
-    tmp_dir = tempfile.mkdtemp(prefix="vo-updater-")
+    os.makedirs(install_root, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="vo-updater-", dir=install_root)
     try:
         outer_tar_path = os.path.join(tmp_dir, "artifact.tar")
         with open(outer_tar_path, "wb") as f:
@@ -293,31 +316,36 @@ def cmd_apply(args: argparse.Namespace) -> int:
         if not os.path.isfile(os.path.join(extract_dir, UPDATE_SCRIPT_NAME)):
             raise ValueError(f"{UPDATE_SCRIPT_NAME} missing from artifact")
 
+        root_entry_names = _iter_install_root_entries(extract_dir)
+        root_backup_dir = os.path.join(tmp_dir, "root-backup")
+        os.makedirs(root_backup_dir, exist_ok=True)
+
         try:
-            if os.path.isdir(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            if os.path.isdir(app_dir):
-                shutil.move(app_dir, backup_dir)
-            log(f"install app: {app_dir}")
-            shutil.move(extract_dir, app_dir)
-            if not _read_text(os.path.join(app_dir, "VERSION")):
-                _write_text(os.path.join(app_dir, "VERSION"), version + "\n")
+            backed_up_root_names: list[str] = []
+            installed_root_names: list[str] = []
+
+            for name in root_entry_names:
+                src = os.path.join(extract_dir, name)
+                dst = os.path.join(install_root, name)
+                backup_path = os.path.join(root_backup_dir, name)
+                if os.path.lexists(dst):
+                    shutil.move(dst, backup_path)
+                    backed_up_root_names.append(name)
+                _copy_path(src, dst)
+                installed_root_names.append(name)
 
             env = os.environ.copy()
             env["VO_INSTALL_ROOT"] = install_root
-            env["VO_APP_DIR"] = app_dir
-            env["VO_APP_BACKUP"] = backup_dir
             env["VO_BACKEND"] = backend
-            _run_update_script(app_dir, env)
-
-            if os.path.isdir(backup_dir):
-                shutil.rmtree(backup_dir, ignore_errors=True)
+            _run_update_script(extract_dir, install_root, env)
         except Exception:
             log("warn: update failed; attempting rollback")
-            if os.path.isdir(app_dir):
-                shutil.rmtree(app_dir, ignore_errors=True)
-            if os.path.isdir(backup_dir):
-                shutil.move(backup_dir, app_dir)
+            for name in installed_root_names:
+                _remove_path(os.path.join(install_root, name))
+            for name in backed_up_root_names:
+                backup_path = os.path.join(root_backup_dir, name)
+                if os.path.lexists(backup_path):
+                    shutil.move(backup_path, os.path.join(install_root, name))
             raise
 
         state = {
@@ -339,7 +367,7 @@ def main() -> None:
     parser.add_argument(
         "--install-root",
         default=_env("VO_INSTALL_ROOT", "/opt/vehicle-overseer"),
-        help="Install root with app/ directory",
+        help="Install root directory",
     )
     parser.add_argument("--force", action="store_true", help="Apply even if artifact matches current")
     parser.add_argument(

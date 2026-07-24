@@ -4,16 +4,9 @@ set -eu
 log() { printf '[device-setup] %s\n' "$*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="${VO_APP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 SYSTEMD_DIR=/etc/systemd/system
 UNIT_SRC="$SCRIPT_DIR/systemd/vehicle-overseer.service"
 UNIT_DST="$SYSTEMD_DIR/vehicle-overseer.service"
-
-# Ensure service.py is available at the app root for manual execution.
-if [ -f "$SCRIPT_DIR/service.py" ]; then
-	cp "$SCRIPT_DIR/service.py" "$APP_DIR/service.py"
-	chmod 0755 "$APP_DIR/service.py"
-fi
 
 NO_SYSTEMD=0
 if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then

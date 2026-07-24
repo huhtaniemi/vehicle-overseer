@@ -1,0 +1,7 @@
+{
+  "include": [
+    "updater.py",
+    "systemd/updater.service",
+    "systemd/updater.timer"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "target": "app",
+  "include": [
+    "service.py",
+    "systemd/vehicle-overseer.service"
+  ]
+}

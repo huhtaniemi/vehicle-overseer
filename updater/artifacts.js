@@ -26,6 +26,7 @@ import { spawnSync } from 'child_process';
 
 // Always emit into backend/data/artifacts so callers can run this script from any directory.
 const ARTIFACTS_DIR = path.resolve(path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'backend', 'data', 'artifacts'));
+const MANIFEST_FILE = 'artifact.json';
 const UPDATE_SCRIPT = 'update.sh';
 const SETUP_SCRIPT = 'setup.sh';
 
@@ -57,7 +58,7 @@ Arguments:
   --script, -s <path> Custom update.sh script (optional)
 
 Behavior:
-  - Copies each module directory into the artifact under its basename
+  - Copies each module's ${MANIFEST_FILE} entries into the artifact
   - Validates that each module has a setup.sh in its root (warns if missing)
   - Generates update.sh that calls each module's setup.sh in order (unless --script provided)
   - Creates VERSION file from <version> argument
@@ -76,8 +77,10 @@ Example:
 }
 
 function generateUpdateScript(moduleNames) {
-  const calls = moduleNames
-    .map((name) => `run_if_present "$APP_DIR/${name}/${SETUP_SCRIPT}"`)
+  const setupRelPaths = moduleNames
+    .map((mod) => (mod.target ? path.posix.join(mod.target, SETUP_SCRIPT) : SETUP_SCRIPT));
+  const calls = setupRelPaths
+    .map((rel) => `run_if_present "$APP_DIR/${rel}"`)
     .join('\n');
 
   return `#!/bin/sh
@@ -85,7 +88,14 @@ set -eu
 
 log() { printf '[update.sh] %s\\n' "$*" >&2; }
 
-APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(pwd)"
+
+rm_if_present() {
+  p="$1"
+  if [ -f "$p" ] || [ -L "$p" ]; then
+    rm -f "$p" || true
+  fi
+}
 
 run_if_present() {
   p="$1"
@@ -98,12 +108,26 @@ run_if_present() {
   else
     sh "$p"
   fi
+  rm_if_present "$p"
 }
 
 ${calls}
 
+if [ -n "\${VO_INSTALL_ROOT:-}" ]; then
+  rm_if_present "$VO_INSTALL_ROOT/${UPDATE_SCRIPT}"
+fi
+rm_if_present "$0"
+
 exit 0
 `;
+}
+
+function normalizeRelativePath(relPath) {
+  const normalized = String(relPath).replace(/\\/g, '/').trim();
+  if (!normalized || normalized.startsWith('/') || normalized.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error(`unsafe manifest path: ${normalized}`);
+  }
+  return normalized;
 }
 
 function buildTarFromDir(dirPath, outTarPath, { gzip } = { gzip: true }) {
@@ -151,7 +175,9 @@ async function main() {
     if (!fs.existsSync(setupPath)) {
       process.stderr.write(`[artifacts] warn: ${name}/${SETUP_SCRIPT} not found\n`);
     }
-    resolvedModules.push({ path: resolved, name });
+    const manifest = JSON.parse(fs.readFileSync(path.join(resolved, MANIFEST_FILE), 'utf-8'));
+    const target = manifest.target ? normalizeRelativePath(manifest.target) : '';
+    resolvedModules.push({ path: resolved, name, setupPath, manifest, target });
   }
 
   // Prepare staging directory
@@ -162,8 +188,19 @@ async function main() {
   try {
     // Copy each module
     for (const mod of resolvedModules) {
-      const dest = path.join(stagingDir, mod.name);
-      fs.cpSync(mod.path, dest, { recursive: true });
+      for (const item of mod.manifest.include) {
+        const rel = normalizeRelativePath(item);
+        if (rel === SETUP_SCRIPT) continue;
+        const dest = path.join(stagingDir, mod.target ? path.posix.join(mod.target, rel) : rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(mod.path, rel), dest);
+      }
+      const setupDest = mod.target ? path.posix.join(mod.target, SETUP_SCRIPT) : SETUP_SCRIPT;
+      if (fs.existsSync(mod.setupPath)) {
+        const dest = path.join(stagingDir, setupDest);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(mod.setupPath, dest);
+      }
       process.stderr.write(`[artifacts] added module: ${mod.name}\n`);
     }
 
@@ -179,7 +216,7 @@ async function main() {
       process.stderr.write(`[artifacts] using custom ${UPDATE_SCRIPT} from ${src}\n`);
     } else {
       const moduleNames = resolvedModules.map((m) => m.name);
-      const script = generateUpdateScript(moduleNames);
+      const script = generateUpdateScript(resolvedModules);
       fs.writeFileSync(updateScriptPath, script, 'utf-8');
       fs.chmodSync(updateScriptPath, 0o755);
       process.stderr.write(`[artifacts] generated ${UPDATE_SCRIPT} for modules: ${moduleNames.join(', ')}\n`);
