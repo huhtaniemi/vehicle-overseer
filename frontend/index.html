@@ -81,6 +81,9 @@
       font-size: 13px;
       line-height: 1.4;
     }
+    #log-content .log-line {
+      min-height: 1.2em;
+    }
     mark { background: #f97316; color: #0b1020; padding: 0 2px; border-radius: 2px; }
     /* Settings overlay */
     #settings-overlay {
@@ -210,6 +213,7 @@
     let entries = new Map();
     let entryNodes = new Map();
     let logSocket = null;
+    let logLines = [];
     let selectedUid = null;
     let orderCounter = 0;
     let selectingUid = null;
@@ -482,28 +486,218 @@
       });
     }
 
-    function highlight(text, terms) {
-      if (!terms.length) return text;
+    const ANSI_PALETTE = [
+      '#111827', '#ef4444', '#22c55e', '#eab308', '#3b82f6', '#d946ef', '#06b6d4', '#e5e7eb',
+      '#6b7280', '#f87171', '#4ade80', '#fde047', '#60a5fa', '#e879f9', '#22d3ee', '#f9fafb'
+    ];
+
+    function xtermColor(index) {
+      if (index < 0) return null;
+      if (index < ANSI_PALETTE.length) return ANSI_PALETTE[index];
+      if (index >= 16 && index <= 231) {
+        const offset = index - 16;
+        const r = Math.floor(offset / 36);
+        const g = Math.floor((offset % 36) / 6);
+        const b = offset % 6;
+        const steps = [0, 95, 135, 175, 215, 255];
+        return `rgb(${steps[r]}, ${steps[g]}, ${steps[b]})`;
+      }
+      if (index >= 232 && index <= 255) {
+        const level = 8 + ((index - 232) * 10);
+        return `rgb(${level}, ${level}, ${level})`;
+      }
+      return null;
+    }
+
+    function applyAnsiCode(state, codes) {
+      if (!codes.length) codes = [0];
+      for (let i = 0; i < codes.length; i += 1) {
+        const code = codes[i];
+        if (code === 0) {
+          state.fg = null;
+          state.bg = null;
+          state.bold = false;
+          continue;
+        }
+        if (code === 1) {
+          state.bold = true;
+          continue;
+        }
+        if (code === 22) {
+          state.bold = false;
+          continue;
+        }
+        if (code === 39) {
+          state.fg = null;
+          continue;
+        }
+        if (code === 49) {
+          state.bg = null;
+          continue;
+        }
+        if (code >= 30 && code <= 37) {
+          state.fg = xtermColor(code - 30);
+          continue;
+        }
+        if (code >= 90 && code <= 97) {
+          state.fg = xtermColor((code - 90) + 8);
+          continue;
+        }
+        if (code >= 40 && code <= 47) {
+          state.bg = xtermColor(code - 40);
+          continue;
+        }
+        if (code >= 100 && code <= 107) {
+          state.bg = xtermColor((code - 100) + 8);
+          continue;
+        }
+        if ((code === 38 || code === 48) && i + 1 < codes.length) {
+          const mode = codes[i + 1];
+          if (mode === 5 && i + 2 < codes.length) {
+            const color = xtermColor(codes[i + 2]);
+            if (code === 38) state.fg = color;
+            else state.bg = color;
+            i += 2;
+            continue;
+          }
+          if (mode === 2 && i + 4 < codes.length) {
+            const r = Math.max(0, Math.min(255, codes[i + 2]));
+            const g = Math.max(0, Math.min(255, codes[i + 3]));
+            const b = Math.max(0, Math.min(255, codes[i + 4]));
+            const color = `rgb(${r}, ${g}, ${b})`;
+            if (code === 38) state.fg = color;
+            else state.bg = color;
+            i += 4;
+          }
+        }
+      }
+    }
+
+    function parseAnsiSegments(text) {
+      const segments = [];
+      const state = { fg: null, bg: null, bold: false };
+      const pattern = /\x1b\[([0-9;]*)m/g;
+      let cursor = 0;
+
+      const pushSegment = (value) => {
+        if (!value) return;
+        const last = segments[segments.length - 1];
+        if (last && last.fg === state.fg && last.bg === state.bg && last.bold === state.bold) {
+          last.text += value;
+          return;
+        }
+        segments.push({ text: value, fg: state.fg, bg: state.bg, bold: state.bold });
+      };
+
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        pushSegment(text.slice(cursor, match.index));
+        const codes = match[1]
+          ? match[1].split(';').map((value) => Number.parseInt(value, 10)).filter(Number.isFinite)
+          : [];
+        applyAnsiCode(state, codes);
+        cursor = pattern.lastIndex;
+      }
+      pushSegment(text.slice(cursor));
+      return segments;
+    }
+
+    function getLogTerms() {
+      return logFilter.value.trim() ? logFilter.value.trim().split(/\s+/).filter(Boolean) : [];
+    }
+
+    function buildHighlightRegex(terms) {
+      if (!terms.length) return null;
       const escaped = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-      const regex = new RegExp(`(${escaped.join('|')})`, 'gi');
-      return text.replace(regex, '<mark>$1</mark>');
+      return new RegExp(`(${escaped.join('|')})`, 'gi');
+    }
+
+    function appendHighlightedText(parent, text, regex) {
+      if (!regex) {
+        parent.appendChild(document.createTextNode(text));
+        return;
+      }
+      const pattern = new RegExp(regex.source, regex.flags);
+      let cursor = 0;
+      for (const match of text.matchAll(pattern)) {
+        const index = match.index ?? 0;
+        if (index > cursor) {
+          parent.appendChild(document.createTextNode(text.slice(cursor, index)));
+        }
+        const mark = document.createElement('mark');
+        mark.textContent = match[0];
+        parent.appendChild(mark);
+        cursor = index + match[0].length;
+      }
+      if (cursor < text.length) {
+        parent.appendChild(document.createTextNode(text.slice(cursor)));
+      }
+    }
+
+    function buildLogLineNode(entry, regex) {
+      const lineEl = document.createElement('div');
+      lineEl.className = entry.muted ? 'log-line muted' : 'log-line';
+      for (const segment of parseAnsiSegments(entry.text)) {
+        const needsStyle = !!(segment.fg || segment.bg || segment.bold);
+        const target = needsStyle ? document.createElement('span') : lineEl;
+        if (needsStyle) {
+          if (segment.fg) target.style.color = segment.fg;
+          if (segment.bg) target.style.backgroundColor = segment.bg;
+          if (segment.bold) target.style.fontWeight = '700';
+        }
+        appendHighlightedText(target, segment.text, regex);
+        if (needsStyle && target.childNodes.length) {
+          lineEl.appendChild(target);
+        }
+      }
+      return lineEl;
+    }
+
+    function isLogsPinnedToBottom() {
+      return logsEl.scrollTop + logsEl.clientHeight >= logsEl.scrollHeight - 4;
+    }
+
+    function scrollLogsToBottom() {
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    function renderLogLines(lines = logLines, { append = false } = {}) {
+      const regex = buildHighlightRegex(getLogTerms());
+      const fragment = document.createDocumentFragment();
+      for (const entry of lines) {
+        fragment.appendChild(buildLogLineNode(entry, regex));
+      }
+      if (append) {
+        logsEl.appendChild(fragment);
+        return;
+      }
+      logsEl.replaceChildren(fragment);
     }
 
     function connectLogs(uid) {
       if (logSocket) logSocket.close();
-      logsEl.innerHTML = '';
+      logLines = [];
+      logsEl.replaceChildren();
       selectedUid = uid;
       const base = new URL(backendBase);
       const proto = base.protocol === 'https:' ? 'wss:' : 'ws:';
-      logSocket = new WebSocket(`${proto}//${base.host}/logs?uid=${encodeURIComponent(uid)}`);
-      logSocket.onmessage = (evt) => {
-        const terms = logFilter.value.trim() ? logFilter.value.trim().split(' ') : [];
-        const line = highlight(evt.data, terms);
-        logsEl.innerHTML += line + '<br />';
-        logsEl.scrollTop = logsEl.scrollHeight;
+      const ws = new WebSocket(`${proto}//${base.host}/logs?uid=${encodeURIComponent(uid)}`);
+      logSocket = ws;
+      ws.onmessage = (evt) => {
+        if (logSocket !== ws) return;
+        const shouldFollow = isLogsPinnedToBottom();
+        const incoming = String(evt.data).replace(/\r\n?/g, '\n').split('\n').map(text => ({ text, muted: false }));
+        logLines.push(...incoming);
+        renderLogLines(incoming, { append: true });
+        if (shouldFollow) scrollLogsToBottom();
       };
-      logSocket.onclose = () => {
-        logsEl.innerHTML += '<div class="muted">[log stream closed]</div>';
+      ws.onclose = () => {
+        if (logSocket !== ws) return;
+        const shouldFollow = isLogsPinnedToBottom();
+        const closedLine = { text: '[log stream closed]', muted: true };
+        logLines.push(closedLine);
+        renderLogLines([closedLine], { append: true });
+        if (shouldFollow) scrollLogsToBottom();
       };
       overlay.style.display = 'flex';
       const entry = entries.get(uid);
@@ -621,10 +815,12 @@
 
     function closeLogs() {
       overlay.style.display = 'none';
-      if (logSocket) logSocket.close();
+      const ws = logSocket;
       logSocket = null;
+      if (ws) ws.close();
+      logLines = [];
       selectedUid = null;
-      logsEl.innerHTML = '';
+      logsEl.replaceChildren();
     }
 
     overlay.addEventListener('click', (e) => {
@@ -645,11 +841,11 @@
     });
 
     logFilter.addEventListener('input', () => {
-      // Reapply highlight to raw lines
-      const terms = logFilter.value.trim() ? logFilter.value.trim().split(' ') : [];
-      const lines = logsEl.innerText.split('\n');
-      logsEl.innerHTML = lines.map(line => highlight(line, terms)).join('<br />');
-      logsEl.scrollTop = logsEl.scrollHeight;
+      const shouldFollow = isLogsPinnedToBottom();
+      const previousScrollTop = logsEl.scrollTop;
+      renderLogLines();
+      if (shouldFollow) scrollLogsToBottom();
+      else logsEl.scrollTop = previousScrollTop;
     });
 
     function closeSelector() {
