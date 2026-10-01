@@ -417,11 +417,11 @@ class ActionTcpService(TcpService):
         new_value = self._replace_mqtt_value(current, requested_ip)
         self._set_by_path(data, key_path, new_value)
 
-        tmp_path = f"{self.jsonpath}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(self.jsonpath, "r+", encoding="utf-8") as f:
+            f.seek(0)
             json.dump(data, f, indent=2)
             f.write("\n")
-        os.replace(tmp_path, self.jsonpath)
+            f.truncate()
         return new_value
 
     def handle_action(self, requested_ip: str) -> dict:
