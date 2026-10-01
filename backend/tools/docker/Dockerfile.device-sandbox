@@ -10,6 +10,8 @@ RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
+RUN useradd -m -u 1000 -s /bin/bash duser
+
 # Create common directories but do not install any project code/config.
 RUN mkdir -p /opt/vehicle-overseer /etc/vehicle-overseer /opt/fordvda \
   && cat > /opt/fordvda/properties.json <<'EOF'
