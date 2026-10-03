@@ -180,6 +180,19 @@ def _run_update_script(staging_dir: str, cwd: str, env: dict[str, str]) -> None:
         raise RuntimeError(f"{UPDATE_SCRIPT_NAME} failed (exit {proc.returncode})")
 
 
+def _record_failed_artifact(state_path: str, artifact_id: str) -> None:
+    state = _read_state(state_path)
+    if not isinstance(state, dict):
+        state = {}
+    blacklisted = state.get("blacklisted")
+    if not isinstance(blacklisted, list):
+        blacklisted = []
+    if artifact_id not in blacklisted:
+        blacklisted.append(artifact_id)
+    state["blacklisted"] = blacklisted
+    _write_text(state_path, json.dumps(state, indent=2) + "\n")
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     backend = args.backend.rstrip("/")
     install_root = args.install_root
@@ -199,8 +212,15 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if not device_uid:
         raise ValueError("device UID required to fetch manifest")
 
-    manifest_uid = urllib.parse.quote(device_uid, safe="")
-    manifest_url = f"{backend}/api/device/manifest?uid={manifest_uid}"
+    state_path = os.path.join(install_root, "state.json")
+    state = _read_state(state_path)
+    if not isinstance(state, dict):
+        state = {}
+    manifest_query = {"uid": device_uid}
+    blacklisted = state.get("blacklisted")
+    if isinstance(blacklisted, list) and blacklisted:
+        manifest_query["blacklisted"] = json.dumps(blacklisted)
+    manifest_url = f"{backend}/api/device/manifest?{urllib.parse.urlencode(manifest_query)}"
     log(f"fetch manifest: {manifest_url}")
     try:
         manifest = _http_get_json(manifest_url)
@@ -233,8 +253,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if artifact_size_bytes is not None and not isinstance(artifact_size_bytes, int):
         artifact_size_bytes = None
 
-    state_path = os.path.join(install_root, "state.json")
-    state = _read_state(state_path)
     current_artifact_id = state.get("artifactId") if state else None
     if not args.force and current_artifact_id == artifact_id:
         log(f"artifact {artifact_id} already installed; skipping")
@@ -299,6 +317,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
         state["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _write_text(state_path, json.dumps(state, indent=2) + "\n")
         log("update complete")
+    except Exception:
+        _record_failed_artifact(state_path, artifact_id)
+        raise
     finally:
         if os.path.exists(artifact_path):
             os.remove(artifact_path)
