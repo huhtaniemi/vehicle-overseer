@@ -23,7 +23,6 @@ PING_INTERVAL_S=__PING_INTERVAL_S__
 INSTALL_ROOT=__INSTALL_ROOT__
 ENV_DIR=__ENV_DIR__
 SYSTEMD_DIR=/etc/systemd/system
-UPDATER_PATH="$INSTALL_ROOT/updater.py"
 UPDATER_SERVICE_NAME=vehicle-overseer-updater.service
 UPDATER_TIMER_NAME=vehicle-overseer-updater.timer
 
@@ -91,18 +90,6 @@ else
   log "keep existing $ENV_DIR/updater.env"
 fi
 
-log "install bootstrap updater"
-FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.py" >"$UPDATER_PATH"
-chmod +x "$UPDATER_PATH"
-
-log "install updater systemd units"
-FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.service" >"$SYSTEMD_DIR/$UPDATER_SERVICE_NAME"
-FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.timer" >"$SYSTEMD_DIR/$UPDATER_TIMER_NAME"
-
-log "enable updater timer"
-systemctl daemon-reload
-systemctl enable --now "$UPDATER_TIMER_NAME"
-
 if [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
   log "open editor to finalize config (device.env, updater.env)"
   if command -v nano >/dev/null 2>&1; then
@@ -116,9 +103,26 @@ else
   log "no interactive TTY; skip editor (edit $ENV_DIR/device.env manually if needed)"
 fi
 
+. "$ENV_DIR/updater.env"
+UPDATER_PATH="$VO_INSTALL_ROOT/updater.py"
+mkdir -p "$VO_INSTALL_ROOT"
+
+log "install bootstrap updater"
+FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.py" >"$UPDATER_PATH"
+chmod +x "$UPDATER_PATH"
+
+log "install updater systemd units"
+FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.service" >"$SYSTEMD_DIR/$UPDATER_SERVICE_NAME"
+FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.timer" >"$SYSTEMD_DIR/$UPDATER_TIMER_NAME"
+
+log "enable updater timer"
+systemctl daemon-reload
+systemctl enable --now "$UPDATER_TIMER_NAME"
+
 log "run updater (initial install)"
 /usr/bin/python3 "$UPDATER_PATH" \
   --backend "$BACKEND_BASE" \
+  --install-root "$VO_INSTALL_ROOT" \
   --force \
   --artifact-key-path "$ENV_DIR/artifact.key" \
   --device-uid-path "$ENV_DIR/device.uid"

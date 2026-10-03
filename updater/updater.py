@@ -21,13 +21,13 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -137,8 +137,8 @@ def _decrypt_aes_256_ctr(ciphertext: bytes, key: bytes, iv_hex: str) -> bytes:
     return proc.stdout
 
 
-def _safe_extract_tar(tar_path: str, dest_dir: str, mode: str = "r:gz") -> None:
-    with tarfile.open(tar_path, mode) as tar:
+def _safe_extract_tar(data: bytes, dest_dir: str, mode: str = "r:gz") -> None:
+    with tarfile.open(fileobj=io.BytesIO(data), mode=mode) as tar:
         for member in tar.getmembers():
             name = member.name
             if name.startswith("/") or name.startswith("\\"):
@@ -161,30 +161,6 @@ def _systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 UPDATE_SCRIPT_NAME = "update.sh"
-
-
-def _remove_path(path: str) -> None:
-    if not os.path.lexists(path):
-        return
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path, ignore_errors=True)
-        return
-    os.unlink(path)
-
-
-def _copy_path(src: str, dst: str) -> None:
-    if os.path.isdir(src) and not os.path.islink(src):
-        shutil.copytree(src, dst, copy_function=shutil.copy2)
-        return
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    shutil.copy2(src, dst)
-
-
-def _iter_install_root_entries(staging_dir: str) -> list[str]:
-    return [
-        name for name in os.listdir(staging_dir)
-        if name not in {UPDATE_SCRIPT_NAME, "VERSION"}
-    ]
 
 
 def _run_update_script(staging_dir: str, cwd: str, env: dict[str, str]) -> None:
@@ -284,17 +260,16 @@ def cmd_apply(args: argparse.Namespace) -> int:
         )
 
     os.makedirs(install_root, exist_ok=True)
-    tmp_dir = tempfile.mkdtemp(prefix="vo-updater-", dir=install_root)
+    artifact_path = os.path.join(install_root, artifact_id)
     try:
-        outer_tar_path = os.path.join(tmp_dir, "artifact.tar")
-        with open(outer_tar_path, "wb") as f:
+        with open(artifact_path, "wb") as f:
             f.write(blob)
 
         # Read packaged hash and inner payload (outer tar contains ./hash and ./data).
-        hash_file_bytes = _read_tar_member_bytes(outer_tar_path, "./hash", "r:*")
+        hash_file_bytes = _read_tar_member_bytes(artifact_path, "./hash", "r:*")
         if not hash_file_bytes:
             raise ValueError("artifact missing hash file")
-        inner_bytes = _read_tar_member_bytes(outer_tar_path, "./data", "r:*")
+        inner_bytes = _read_tar_member_bytes(artifact_path, "./data", "r:*")
         if not inner_bytes:
             raise ValueError("artifact missing data file")
 
@@ -305,59 +280,28 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 f"artifact hash mismatch: payload {inner_sha}, hash file {hash_file_val}"
             )
 
-        inner_tar_path = os.path.join(tmp_dir, "artifact.tar.gz")
-        with open(inner_tar_path, "wb") as f:
-            f.write(inner_bytes)
-
-        extract_dir = os.path.join(tmp_dir, "extract")
-        os.makedirs(extract_dir, exist_ok=True)
         log("extract artifact")
-        _safe_extract_tar(inner_tar_path, extract_dir, "r:gz")
-        if not os.path.isfile(os.path.join(extract_dir, UPDATE_SCRIPT_NAME)):
+        _safe_extract_tar(inner_bytes, install_root, "r:gz")
+        if not os.path.isfile(os.path.join(install_root, UPDATE_SCRIPT_NAME)):
             raise ValueError(f"{UPDATE_SCRIPT_NAME} missing from artifact")
 
-        root_entry_names = _iter_install_root_entries(extract_dir)
-        root_backup_dir = os.path.join(tmp_dir, "root-backup")
-        os.makedirs(root_backup_dir, exist_ok=True)
+        env = os.environ.copy()
+        env["VO_INSTALL_ROOT"] = install_root
+        env["VO_BACKEND"] = backend
+        _run_update_script(install_root, install_root, env)
 
-        try:
-            backed_up_root_names: list[str] = []
-            installed_root_names: list[str] = []
-
-            for name in root_entry_names:
-                src = os.path.join(extract_dir, name)
-                dst = os.path.join(install_root, name)
-                backup_path = os.path.join(root_backup_dir, name)
-                if os.path.lexists(dst):
-                    shutil.move(dst, backup_path)
-                    backed_up_root_names.append(name)
-                _copy_path(src, dst)
-                installed_root_names.append(name)
-
-            env = os.environ.copy()
-            env["VO_INSTALL_ROOT"] = install_root
-            env["VO_BACKEND"] = backend
-            _run_update_script(extract_dir, install_root, env)
-        except Exception:
-            log("warn: update failed; attempting rollback")
-            for name in installed_root_names:
-                _remove_path(os.path.join(install_root, name))
-            for name in backed_up_root_names:
-                backup_path = os.path.join(root_backup_dir, name)
-                if os.path.lexists(backup_path):
-                    shutil.move(backup_path, os.path.join(install_root, name))
-            raise
-
-        state = {
-            "uid": device_uid,
-            "version": version,
-            "artifactId": artifact_id,
-            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        _write_text(os.path.join(install_root, "state.json"), json.dumps(state, indent=2) + "\n")
+        state = _read_state(state_path)
+        if not isinstance(state, dict):
+            state = {}
+        state["uid"] = device_uid
+        state["version"] = version
+        state["artifactId"] = artifact_id
+        state["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_text(state_path, json.dumps(state, indent=2) + "\n")
         log("update complete")
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if os.path.exists(artifact_path):
+            os.remove(artifact_path)
     return 0
 
 
