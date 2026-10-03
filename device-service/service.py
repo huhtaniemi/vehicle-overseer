@@ -123,15 +123,15 @@ class Device:
         self.wait_timeout_s = wait_timeout_s
 
     def _read_service_version(self) -> str | None:
-        base = os.path.dirname(os.path.abspath(__file__))
-        for candidate in (os.path.join(base, "VERSION"), os.path.join(base, "version.txt")):
-            try:
-                with open(candidate, "r", encoding="utf-8") as f:
-                    v = f.read().strip()
-                return v or None
-            except FileNotFoundError:
-                continue
-        return None
+        base = os.path.dirname(os.path.realpath(__file__))
+        raw = _read_text(os.path.join(os.path.dirname(base), "state.json"))
+        if not raw:
+            return None
+        try:
+            version = json.loads(raw).get("version")
+        except json.JSONDecodeError:
+            return None
+        return version if isinstance(version, str) and version else None
 
     def start(self) -> None:
         if self.report_iface:
@@ -214,9 +214,7 @@ class Device:
                     continue
 
             data: dict[str, object] = {
-                "version": {
-                    "serviceVersion": self._service_version,
-                },
+                "version": self._service_version,
             }
             for listener in self._listeners:
                 data[listener.kind+"Port"] = listener.port

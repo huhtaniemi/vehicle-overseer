@@ -11,7 +11,7 @@
     .pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.12); font-size: 14px; }
     .pill span { font-weight: 600; }
     .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); margin-bottom: 12px; }
-    .entry { border: 1px solid #e4e7ed; border-left: 6px solid transparent; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+    .entry { border: 1px solid #e4e7ed; border-left: 6px solid transparent; border-radius: 10px; padding: 8px; margin-bottom: 10px; }
     .entry.online { border-left-color: var(--green); }
     .entry.offline { border-left-color: var(--gray); opacity: 0.7; }
     .entry.error { border-left-color: var(--red); }
@@ -294,10 +294,11 @@
         const e = entries.get(uid);
         if (!e) return;
         lastSeenEl.textContent = formatAge(now - e.lastUpdate);
+        const version = typeof e.data?.version === 'string' ? ` · ${e.data.version}` : '';
         if (e.status === 'online') {
-          lastSeenEl.title = 'online since ' + formatLastSeenDate(e.onlineSince);
+          lastSeenEl.title = 'online since ' + formatLastSeenDate(e.onlineSince) + version;
         } else {
-          lastSeenEl.title = 'last seen ' + formatLastSeenDate(e.lastUpdate);
+          lastSeenEl.title = 'last seen ' + formatLastSeenDate(e.lastUpdate) + version;
         }
       });
     }
@@ -402,14 +403,15 @@
 
     function applyEntryToNode(entry, node) {
       const displayName = entry.label || entry.uid;
+      const version = typeof entry.data?.version === 'string' ? ` · ${entry.data.version}` : '';
       node.root.className = `entry ${entry.status}${entry.flash ? ' flash' : ''}`;
       node.titleEl.innerHTML = `<strong>${displayName}</strong> — ${entry.ip || 'n/a'} · `;
       node.titleEl.appendChild(node.lastSeenEl);
       node.lastSeenEl.textContent = formatAge(getServerNow() - entry.lastUpdate);
       if (entry.status === 'online') {
-        node.lastSeenEl.title = 'online since ' + formatLastSeenDate(entry.onlineSince);
+        node.lastSeenEl.title = 'online since ' + formatLastSeenDate(entry.onlineSince) + version;
       } else {
-        node.lastSeenEl.title = 'last seen ' + formatLastSeenDate(entry.lastUpdate);
+        node.lastSeenEl.title = 'last seen ' + formatLastSeenDate(entry.lastUpdate) + version;
       }
       const stageMsg = entry.stage || '';
       node.ipBtn.textContent = entry.selectedIp || 'select mqtt';
