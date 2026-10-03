@@ -82,6 +82,12 @@ function generateUpdateScript(moduleNames) {
   const calls = setupRelPaths
     .map((rel) => `run_if_present "$APP_DIR/${rel}"`)
     .join('\n');
+  const files = moduleNames.flatMap((mod) => mod.manifest.include
+    .filter((item) => item !== SETUP_SCRIPT)
+    .map((item) => {
+      const rel = normalizeRelativePath(item);
+      return mod.target ? path.posix.join(mod.target, rel) : rel;
+    }));
 
   return `#!/bin/sh
 set -eu
@@ -89,6 +95,7 @@ set -eu
 log() { printf '[update.sh] %s\\n' "$*" >&2; }
 
 APP_DIR="$(pwd)"
+STATE_PATH="$APP_DIR/state.json"
 
 rm_if_present() {
   p="$1"
@@ -110,6 +117,42 @@ run_if_present() {
   fi
   rm_if_present "$p"
 }
+
+update_state_files() {
+  python3 - "$STATE_PATH" "$APP_DIR" <<'PY'
+import json
+import os
+import sys
+
+state_path, install_root = sys.argv[1:]
+
+try:
+    with open(state_path, "r", encoding="utf-8") as state_file:
+        state = json.load(state_file)
+except FileNotFoundError:
+    state = {}
+
+new_files = ${JSON.stringify(files)}
+
+old_files = state.get("files", [])
+new_file_set = set(new_files)
+for path in old_files:
+    if path in new_file_set:
+        continue
+    full_path = os.path.join(install_root, path)
+    if os.path.exists(full_path):
+        os.remove(full_path)
+
+state["files"] = new_files
+tmp_path = f"{state_path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as state_file:
+    json.dump(state, state_file, indent=2)
+    state_file.write("\\n")
+os.replace(tmp_path, state_path)
+PY
+}
+
+update_state_files
 
 ${calls}
 
