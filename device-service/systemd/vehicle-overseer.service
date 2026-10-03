@@ -5,9 +5,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/vehicle-overseer/app
 EnvironmentFile=/etc/vehicle-overseer/device.env
-ExecStart=/usr/bin/python3 -u /opt/vehicle-overseer/app/service.py run
+ExecStart=/usr/bin/python3 -u /usr/local/bin/vehicle-overseer-service.py run
 Restart=always
 RestartSec=3
 TimeoutStartSec=0

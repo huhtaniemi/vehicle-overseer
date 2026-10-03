@@ -57,6 +57,8 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 mkdir -p "$SYSTEMD_DIR"
+mkdir -p /usr/local/bin
+ln -sfnT "$INSTALL_ROOT/updater.py" /usr/local/bin/vehicle-overseer-updater.py
 
 if [ -f "$SRC_DIR/updater.service" ]; then
   cp "$SRC_DIR/updater.service" "$SYSTEMD_DIR/$UPDATER_SERVICE_NAME"

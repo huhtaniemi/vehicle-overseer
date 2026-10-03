@@ -105,7 +105,8 @@ fi
 
 . "$ENV_DIR/updater.env"
 UPDATER_PATH="$VO_INSTALL_ROOT/updater.py"
-mkdir -p "$VO_INSTALL_ROOT"
+mkdir -p "$VO_INSTALL_ROOT" /usr/local/bin
+ln -sfnT "$UPDATER_PATH" /usr/local/bin/vehicle-overseer-updater.py
 
 log "install bootstrap updater"
 FETCH "$BACKEND_BASE/api/srvcsetup/files/updater.py" >"$UPDATER_PATH"

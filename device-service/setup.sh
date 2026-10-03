@@ -24,6 +24,8 @@ if [ ! -d "$SYSTEMD_DIR" ]; then
 	exit 2
 fi
 
+mkdir -p /usr/local/bin
+ln -sfnT "${VO_INSTALL_ROOT:-$(dirname "$SCRIPT_DIR")}/app/service.py" /usr/local/bin/vehicle-overseer-service.py
 cp "$UNIT_SRC" "$UNIT_DST"
 chmod 0644 "$UNIT_DST"
 
