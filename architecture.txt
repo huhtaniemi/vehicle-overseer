@@ -37,7 +37,7 @@ Architecture overview (current implementation + clarified target behavior)
       - `GET /api/device/key?token=...` provisions an optional per-device transfer key (used by the updater for encrypted downloads).
     - Updates (artifact distribution):
       - Artifacts are stored by hash under `backend/data/artifacts/<sha256>` (artifact id = sha256).
-      - Versions are tags in SQLite (`versions.version`) mapped to an artifact id (`versions.artifact_id`).
+      - Versions are tags in the database (`versions.version`) mapped to an artifact id (`versions.artifact_id`).
         - Local tooling: `node updater/artifacts.js vX.Y.Z --module ./updater --module ./device-service`
         - Server (SEA dist): `./vehicle-overseer-backend artifacts import /path/to/<artifact-hash>`
   - WebSocket:
@@ -47,7 +47,7 @@ Architecture overview (current implementation + clarified target behavior)
     - Host: the latest `ip-address` reported by the service.
     - Ports: `data.actionPort` / `data.logPort` reported by the service (fallback: backend config `deviceActionPort` / `deviceLogPort`).
   - Persistence:
-    - SQLite via `sql.js` stores update artifacts + versions, per-device update targets, device transfer keys, and bootstrap tokens.
+    - The database stores update artifacts + versions, per-device update targets, device transfer keys, and bootstrap tokens.
     - Live entry state (pings), action selections, and reported runtime versions stay in memory only.
 
 - Target device / service (current direction):

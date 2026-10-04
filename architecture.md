@@ -15,7 +15,7 @@ flowchart LR
     ActionConn["Per-action connection<br/>backend → device<br/>host = ip-address<br/>port = deviceActionPort"]
     Stages["Backend stages (real steps)<br/>connecting/apply/restart/success"]
     Logs["WS /logs?uid=...<br/>log proxy<br/>port = deviceLogPort"]
-    DB["SQLite (sql.js)<br/>artifacts + versions<br/>device targets + keys + tokens"]
+    DB["database<br/>artifacts + versions<br/>device targets + keys + tokens"]
   end
 
   subgraph UI["Web UI (mobile-first)"]

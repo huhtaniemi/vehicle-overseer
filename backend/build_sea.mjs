@@ -103,8 +103,6 @@ if (platform === 'darwin') {
 run(tool('postject'), postjectArgs, { cwd: backendRoot });
 
 // 4) Copy runtime assets next to the binary
-copyFile(path.join(backendRoot, 'schema.sql'), path.join(distDir, 'schema.sql'));
-
 // Service/provisioning assets: backend serves these at runtime.
 copyFile(path.join(repoRoot, 'updater', 'srvcsetup.sh'), path.join(distDir, 'updater', 'srvcsetup.sh'));
 copyFile(
@@ -112,12 +110,6 @@ copyFile(
   path.join(distDir, 'updater', 'updater.py')
 );
 copyDir(path.join(repoRoot, 'updater', 'systemd'), path.join(distDir, 'updater', 'systemd'));
-
-// sql.js WASM: required at runtime next to the executable.
-copyFile(
-  path.join(backendRoot, 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm'),
-  path.join(distDir, 'sql-wasm.wasm')
-);
 
 // Optional: package the entire dist/ directory for easy server transport.
 if (shouldTar) {

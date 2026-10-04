@@ -6,12 +6,12 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "test": "node --test",
     "artifacts": "node ../updater/artifacts.js",
     "build:sea": "node build_sea.mjs",
     "clean:dist": "rm -rf dist"
   },
   "dependencies": {
-    "sql.js": "^1.9.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {

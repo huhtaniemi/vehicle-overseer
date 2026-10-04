@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 // Minimal functional backend: HTTP API + WebSockets, per-action device connections, and log proxying.
-// Uses sql.js (WASM SQLite) for portability; no native builds required.
 
 import http from 'http';
 import fs from 'fs';
@@ -9,9 +8,8 @@ import path from 'path';
 import url from 'url';
 import net from 'net';
 import crypto from 'crypto';
-import initSqlJs from 'sql.js';
 import { WebSocketServer } from 'ws';
-import { runArtifactsCli, refreshArtifacts } from './artifacts_cli.js';
+import { runArtifactsCli, refreshArtifacts, openDb } from './artifacts_cli.js';
 
 // Derive this file's directory in both dev (node) and SEA binary contexts without import.meta.
 const selfDir = (() => {
@@ -27,7 +25,7 @@ const rootDir = process.cwd() || devRootDir;
 
 async function main() {
   const defaultConfig = {
-    dbPath: './data/vehicle_overseer.sqlite',
+    dbPath: './data/db',
     httpHost: '0.0.0.0',
     httpPort: 3100,
     defaultSshUser: null,
@@ -51,54 +49,6 @@ async function main() {
 
   const config = loadConfig();
 
-  const locateSqlFile = (file) => {
-    const packaged = fs.existsSync(path.join(rootDir, file));
-    if (packaged) return path.join(rootDir, file);
-    return path.join(rootDir, 'node_modules', 'sql.js', 'dist', file);
-  };
-
-  const ensureArtifactsInsertedAtColumn = async () => {
-    const SQL = await initSqlJs({ locateFile: locateSqlFile });
-    const dbPathResolved = path.resolve(rootDir, config.dbPath);
-    const schemaPath = path.resolve(rootDir, 'schema.sql');
-    const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
-    const db = fs.existsSync(dbPathResolved)
-      ? new SQL.Database(fs.readFileSync(dbPathResolved))
-      : new SQL.Database();
-    db.run(schemaSql);
-    let hasInsertedAt = false;
-    const stmt = db.prepare('PRAGMA table_info(artifacts)');
-    while (stmt.step()) {
-      const row = stmt.getAsObject();
-      if (String(row.name) === 'inserted_at') {
-        hasInsertedAt = true;
-        break;
-      }
-    }
-    stmt.free();
-    if (!hasInsertedAt) {
-      db.run(`ALTER TABLE artifacts ADD COLUMN inserted_at TEXT NOT NULL DEFAULT ''`);
-      db.run(
-        `UPDATE artifacts
-         SET inserted_at = COALESCE(created_at, datetime('now'))
-         WHERE inserted_at IS NULL OR inserted_at = ''`
-      );
-      const data = db.export();
-      fs.mkdirSync(path.dirname(dbPathResolved), { recursive: true });
-      const tmp = `${dbPathResolved}.tmp-${process.pid}-${Date.now()}`;
-      fs.writeFileSync(tmp, Buffer.from(data));
-      fs.renameSync(tmp, dbPathResolved);
-      console.log('[db] added artifacts.inserted_at');
-    }
-    try {
-      db.close();
-    } catch {
-      // ignore
-    }
-  };
-
-  await ensureArtifactsInsertedAtColumn();
-
   // CLI mode: manage artifacts without starting the server.
   // This is used in SEA dist so the server can import artifacts without Node installed.
   const argv = process.argv.slice(2);
@@ -112,97 +62,17 @@ async function main() {
   }
 
 
-
   // Ensure data directory
   const dataDir = path.resolve(rootDir, 'data');
   fs.mkdirSync(dataDir, { recursive: true });
 
-  // Initialize sql.js database (portable SQLite)
-  /*
-  const SQL = await initSqlJs({
-    locateFile: (file) => {
-      // sql.js needs sql-wasm.wasm. In dev it lives in node_modules; in packaged builds it must be
-      // shipped next to the executable (same dir as process.execPath).
-      const packaged = fs.existsSync(path.join(rootDir, file));
-      if (packaged) return path.join(rootDir, file);
-      return path.join(rootDir, 'node_modules', 'sql.js', 'dist', file);
-    }
-  });
-  */
-  const SQL = await initSqlJs({ locateFile: locateSqlFile });
-  const dbPath = path.resolve(rootDir, config.dbPath);
-  let db;
-  if (fs.existsSync(dbPath)) {
-    db = new SQL.Database(fs.readFileSync(dbPath));
-  } else {
-    db = new SQL.Database();
-  }
-  const schemaPath = path.resolve(rootDir, 'schema.sql');
-  const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
-  db.run(schemaSql);
-  let dbLastMtimeMs = fs.existsSync(dbPath) ? fs.statSync(dbPath).mtimeMs : 0;
+  // Initialize database
+  const db = openDb({ rootDir, config });
+  const saveDb = () => db.commit();
 
-  const saveDb = () => {
-    const data = db.export();
-    const tmp = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmp, Buffer.from(data));
-    fs.renameSync(tmp, dbPath);
-    try {
-      dbLastMtimeMs = fs.statSync(dbPath).mtimeMs;
-    } catch {
-      // ignore
-    }
-  };
+  const getArtifactById = (artifactId) => db.getArtifact(artifactId);
 
-  const maybeReloadDbFromDisk = () => {
-    if (!fs.existsSync(dbPath)) return;
-    const m = fs.statSync(dbPath).mtimeMs;
-    if (m <= dbLastMtimeMs) return;
-    const buf = fs.readFileSync(dbPath);
-    try {
-      db.close();
-    } catch {
-      // ignore
-    }
-    db = new SQL.Database(buf);
-    db.run(schemaSql);
-    dbLastMtimeMs = m;
-    console.log('[db] reloaded from disk (external change detected)');
-  };
-
-  const run = (sql, params = {}) => {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    stmt.step();
-    stmt.free();
-  };
-
-  const getRow = (sql, params = {}) => {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    const row = stmt.step() ? stmt.getAsObject() : null;
-    stmt.free();
-    return row;
-  };
-
-  const getArtifactById = (artifactId) => getRow(
-    'SELECT id, filename, size_bytes FROM artifacts WHERE id = $id LIMIT 1',
-    { $id: artifactId }
-  );
-
-  const getDeviceKeyByUid = (deviceUid) => getRow(
-    'SELECT key_b64, key_id FROM device_keys WHERE device_uid = $uid LIMIT 1',
-    { $uid: deviceUid }
-  );
-
-  const getRows = (sql, params = {}) => {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    const rows = [];
-    while (stmt.step()) rows.push(stmt.getAsObject());
-    stmt.free();
-    return rows;
-  };
+  const getDeviceKeyByUid = (deviceUid) => db.getDeviceKey(deviceUid);
 
   const resolvePositiveNumber = (value, fallback) => {
     const num = Number(value);
@@ -279,23 +149,19 @@ async function main() {
 
   const createBootstrapToken = ({ kind }) => {
     const token = crypto.randomBytes(24).toString('base64url');
-    run(
-      `INSERT INTO bootstrap_tokens (token, kind, created_at, used_at)
-       VALUES ($t, $kind, datetime('now'), NULL)`,
-      { $t: token, $kind: kind }
-    );
-    saveDb();
+    db.begin();
+    try {
+      db.insertBootstrapToken({ token, kind, created_at: new Date().toISOString(), used_at: null });
+      saveDb();
+    } catch (err) {
+      db.rollback();
+      throw err;
+    }
     return token;
   };
 
   const resolveUpdateTarget = (deviceUid) => {
-    const row = getRow(
-      `SELECT desired_version
-       FROM device_targets
-       WHERE device_uid = $uid
-       LIMIT 1`,
-      { $uid: deviceUid }
-    );
+    const row = db.getDeviceTarget(deviceUid);
     return { desiredVersion: row?.desired_version ?? null };
   };
 
@@ -303,31 +169,21 @@ async function main() {
     let version = desiredVersion;
     if (version === 'latest') version = null;
     if (!version) {
-      const latest = getRow(
-        `SELECT v.version AS version
-         FROM versions v
-         JOIN artifacts a ON a.id = v.artifact_id
-         WHERE v.version != 'latest'
-         ORDER BY datetime(a.created_at) DESC, v.version DESC
-         LIMIT 1`,
-        {}
-      );
+      const latest = db.getLatestVersion();
       version = latest?.version || null;
     }
     if (!version) return null;
-    return getRow(
-      `SELECT
-         v.version AS version,
-         a.id AS artifactId,
-         a.filename AS filename,
-         a.size_bytes AS size_bytes,
-         a.created_at AS created_at
-       FROM versions v
-       JOIN artifacts a ON a.id = v.artifact_id
-       WHERE v.version = $version
-       LIMIT 1`,
-      { $version: version }
-    );
+    const row = db.getVersion(version);
+    if (!row) return null;
+    const artifact = db.getArtifact(row.artifact_id);
+    if (!artifact) return null;
+    return {
+      version: row.version,
+      artifactId: artifact.id,
+      filename: artifact.filename,
+      size_bytes: artifact.size_bytes,
+      created_at: artifact.created_at
+    };
   };
 
   const computeStatus = (entry) => (Date.now() - entry.lastUpdate > OFFLINE_TIMEOUT_MS ? 'offline' : 'online');
@@ -376,12 +232,6 @@ async function main() {
   async function handleRequest(req, res) {
     const parsedUrl = new url.URL(req.url, `http://${req.headers.host}`);
     const { pathname } = parsedUrl;
-
-    try {
-      maybeReloadDbFromDisk();
-    } catch (err) {
-      console.warn('[db] reload failed', { err: err.message });
-    }
 
     if (req.method !== 'OPTIONS' && pathname !== '/api/ping') {
       const start = Date.now();
@@ -663,20 +513,17 @@ async function main() {
 	          return res.end(JSON.stringify({ error: 'forbidden' }));
 	        }
 
-	        const tokenRow = getRow(
-	          `SELECT token, kind, used_at
-	           FROM bootstrap_tokens
-	           WHERE token = $t
-	           LIMIT 1`,
-	          { $t: token }
-	        );
+	        db.begin();
+	        const tokenRow = db.getBootstrapToken(token);
 	        if (!tokenRow) {
+	          db.rollback();
 	          res.writeHead(403, { 'Content-Type': 'application/json' });
 	          return res.end(JSON.stringify({ error: 'forbidden' }));
 	        }
 	        const kind = String(tokenRow.kind || 'one-time');
 	        const isDev = kind === 'dev';
 	        if (!isDev && tokenRow.used_at) {
+	          db.rollback();
 	          res.writeHead(403, { 'Content-Type': 'application/json' });
 	          return res.end(JSON.stringify({ error: 'forbidden' }));
 	        }
@@ -684,25 +531,17 @@ async function main() {
 	        const deviceUid = crypto.randomBytes(16).toString('hex');
 	        const keyB64 = crypto.randomBytes(32).toString('base64');
 	        const keyId = crypto.randomBytes(8).toString('hex');
-	        run(
-	          `INSERT INTO device_keys (device_uid, key_id, key_b64, created_at, updated_at)
-	           VALUES ($uid, $key_id, $key_b64, datetime('now'), datetime('now'))`,
-	          { $uid: deviceUid, $key_id: keyId, $key_b64: keyB64 }
-	        );
+	        const now = new Date().toISOString();
+	        db.insertDeviceKey({ device_uid: deviceUid, key_id: keyId, key_b64: keyB64, created_at: now, updated_at: now });
 
 	        if (!isDev) {
-	          run(
-	            `UPDATE bootstrap_tokens
-	             SET used_at = datetime('now')
-	             WHERE token = $t AND used_at IS NULL`,
-	            { $t: token }
-	          );
+	          db.markBootstrapTokenUsed(token, now);
 	        }
 	        saveDb();
-
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end(`${deviceUid}\n${keyB64}\n`);
 	      } catch (err) {
+	        db.rollback();
 	        res.writeHead(500, { 'Content-Type': 'application/json' });
 	        return res.end(JSON.stringify({ error: 'key error', details: err.message }));
 	      }

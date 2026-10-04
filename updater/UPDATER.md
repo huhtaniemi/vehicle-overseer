@@ -77,11 +77,11 @@ node ../updater/artifacts.js v0.1.0 --module ../updater --module ../device-servi
 
 Artifacts are stored to `<backend-cwd>/data/artifacts/`.
 
-Backend syncs disk↔SQLite via the `refresh` command:
+Backend syncs disk↔database via the `refresh` command:
 
 ```bash
 # From backend/ directory:
-node src/artifacts_cli.js refresh
+node src/index.js artifacts refresh
 
 # Or via SEA binary:
 ./vehicle-overseer-backend artifacts refresh

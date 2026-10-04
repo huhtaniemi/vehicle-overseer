@@ -3,7 +3,6 @@
 import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
-import initSqlJs from 'sql.js';
 
 const ARTIFACTS_DIR = 'data/artifacts';
 
@@ -20,7 +19,7 @@ function usage(exitCode = 0) {
 
 ID is read from hash file inside the tarball.
 Version is read from VERSION file inside the tarball.
-Missing artifacts are removed from SQLite on refresh.
+Missing artifacts are removed from database on refresh.
 `;
   process.stderr.write(msg);
   process.exit(exitCode);
@@ -100,46 +99,174 @@ function readVersionAndDateFromArtifact(filePath) {
   } : { version: null, date: null };
 }
 
-function openDb({ SQL, dbPath, schemaSql }) {
-  let db;
-  if (fs.existsSync(dbPath)) db = new SQL.Database(fs.readFileSync(dbPath));
-  else db = new SQL.Database();
-  db.run(schemaSql);
-  return db;
-}
+export function openDb({ rootDir, config = {} }) {
+  const dbPath = path.resolve(rootDir, config.dbPath || './data/db');
+  const artifactsDir = path.resolve(rootDir, ARTIFACTS_DIR);
+  const tables = ['artifacts', 'versions', 'device_targets', 'device_keys', 'bootstrap_tokens'];
+  for (const table of tables) fs.mkdirSync(path.join(dbPath, table), { recursive: true, mode: 0o700 });
+  const lockPath = path.join(dbPath, '.writer-lock');
+  let pending = null;
 
-function saveDbAtomic(db, dbPath) {
-  const data = db.export();
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  const tmp = `${dbPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmp, Buffer.from(data));
-  fs.renameSync(tmp, dbPath);
+  const recordPath = (table, key) => path.join(dbPath, table, encodeURIComponent(key).replace(/^\./, '%2E'));
+  const readLink = (table, key) => {
+    const filename = recordPath(table, key);
+    if (pending?.has(filename)) return pending.get(filename)?.value ?? null;
+    try {
+      return fs.readlinkSync(filename);
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }
+  };
+  const readRecord = (table, key) => {
+    const filename = recordPath(table, key);
+    if (pending?.has(filename)) return pending.get(filename)?.value ?? null;
+    try {
+      return JSON.parse(fs.readFileSync(filename, 'utf-8'));
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }
+  };
+  const listKeys = (table) => {
+    const directory = path.join(dbPath, table);
+    const keys = new Set(fs.readdirSync(directory).filter(name => !name.startsWith('.')));
+    if (pending) {
+      for (const [filename, record] of pending) {
+        if (path.dirname(filename) !== directory) continue;
+        if (record) keys.add(path.basename(filename));
+        else keys.delete(path.basename(filename));
+      }
+    }
+    return [...keys].map(name => decodeURIComponent(name));
+  };
+  const writeAtomic = (filename, record) => {
+    if (!record) return fs.rmSync(filename, { force: true });
+    const tmp = path.join(path.dirname(filename), `.tmp-${process.pid}-${Date.now()}`);
+    try {
+      if (record.kind === 'link') fs.symlinkSync(record.value, tmp);
+      else fs.writeFileSync(tmp, JSON.stringify(record.value, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, filename);
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
+  };
+  const write = (table, key, record) => {
+    const filename = recordPath(table, key);
+    if (pending) pending.set(filename, record);
+    else writeAtomic(filename, record);
+  };
+  const writeLink = (table, key, destination) => write(table, key, {
+    kind: 'link', value: path.relative(path.join(dbPath, table), destination)
+  });
+  const writeRecord = (table, key, record) => write(table, key, { kind: 'json', value: record });
+  const getArtifact = (id) => {
+    const link = readLink('artifacts', id);
+    if (link === null) return null;
+    const filePath = path.resolve(path.join(dbPath, 'artifacts'), link);
+    try {
+      const stat = fs.statSync(filePath);
+      const { version, date } = readVersionAndDateFromArtifact(filePath);
+      const filename = recordPath('artifacts', id);
+      return {
+        id, filename: path.basename(filePath), size_bytes: stat.size, created_at: date, version,
+        inserted_at: pending?.has(filename) ? null : fs.lstatSync(filename).mtime.toISOString()
+      };
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }
+  };
+  const getVersion = (version) => {
+    const link = readLink('versions', version);
+    return link === null ? null : { version, artifact_id: decodeURIComponent(path.basename(link)) };
+  };
+  const listVersions = () => listKeys('versions').map(version => {
+    const record = getVersion(version);
+    const artifact = getArtifact(record.artifact_id);
+    return { ...record, size_bytes: artifact?.size_bytes ?? null, created_at: artifact?.created_at ?? null };
+  });
+  const getLatestVersion = () => {
+    const versions = listVersions().filter(record => record.version !== 'latest' && getArtifact(record.artifact_id));
+    versions.sort((first, second) => {
+      const dateOrder = (Date.parse(second.created_at) || 0) - (Date.parse(first.created_at) || 0);
+      return dateOrder || (first.version < second.version ? 1 : first.version > second.version ? -1 : 0);
+    });
+    return versions.length ? { version: versions[0].version, artifact_id: versions[0].artifact_id } : null;
+  };
+  const rollback = () => {
+    if (!pending) return;
+    pending = null;
+    fs.rmdirSync(lockPath);
+  };
+
+  return {
+    getArtifact,
+    getVersion,
+    listVersions,
+    getLatestVersion,
+    listArtifacts: () => listKeys('artifacts').map(id => ({ id })),
+    insertArtifact: ({ id, filename }, replace = false) => {
+      if (replace || readLink('artifacts', id) === null) writeLink('artifacts', id, path.join(artifactsDir, filename));
+    },
+    insertVersion: (version, id, replace = false) => {
+      if (replace || getVersion(version) === null) writeLink('versions', version, recordPath('artifacts', id));
+    },
+    deleteArtifact: (id) => write('artifacts', id, null),
+    deleteVersionsForArtifact: (id) => {
+      for (const version of listKeys('versions')) {
+        if (getVersion(version).artifact_id === id) write('versions', version, null);
+      }
+    },
+    getDeviceTarget: (uid) => {
+      const link = readLink('device_targets', uid);
+      if (link === null) return null;
+      return {
+        desired_version: decodeURIComponent(path.basename(link)),
+        updated_at: fs.lstatSync(recordPath('device_targets', uid)).mtime.toISOString()
+      };
+    },
+    setDeviceTarget: (uid, version) => {
+      if (!version) write('device_targets', uid, null);
+      else writeLink('device_targets', uid, recordPath('versions', version));
+    },
+    getDeviceKey: (uid) => readRecord('device_keys', uid),
+    insertDeviceKey: ({ device_uid, ...record }) => writeRecord('device_keys', device_uid, record),
+    getBootstrapToken: (token) => readRecord('bootstrap_tokens', token),
+    insertBootstrapToken: ({ token, ...record }) => writeRecord('bootstrap_tokens', token, record),
+    markBootstrapTokenUsed: (token, usedAt) => {
+      const record = readRecord('bootstrap_tokens', token);
+      if (record && !record.used_at) writeRecord('bootstrap_tokens', token, { ...record, used_at: usedAt });
+    },
+    begin: () => {
+      try {
+        fs.mkdirSync(lockPath, { mode: 0o700 });
+      } catch (err) {
+        if (err.code === 'EEXIST') throw new Error('database busy: another writer holds .writer-lock');
+        throw err;
+      }
+      pending = new Map();
+    },
+    commit: () => {
+      if (!pending) return;
+      try {
+        for (const [filename, record] of pending) writeAtomic(filename, record);
+      } finally {
+        rollback();
+      }
+    },
+    rollback
+  };
 }
 
 function updateArtifact(run, { id, filename, sizeBytes, createdAt, version }) {
-  run(
-    `INSERT OR IGNORE INTO artifacts (id, filename, size_bytes, created_at, inserted_at)
-     VALUES ($id, $fn, $sz, $ca, datetime('now'))`,
-    { $id: id, $fn: filename, $sz: sizeBytes, $ca: createdAt }
-  );
-  run(
-    `INSERT OR IGNORE INTO versions (version, artifact_id, notes)
-     VALUES ($v, $id, NULL)`,
-    { $v: version, $id: id }
-  );
+  run.insertArtifact({ id, filename, sizeBytes, createdAt });
+  run.insertVersion(version, id);
 }
 
 function upsertArtifact(run, { id, filename, sizeBytes, createdAt, version }) {
-  run(
-    `INSERT OR REPLACE INTO artifacts (id, filename, size_bytes, created_at, inserted_at)
-     VALUES ($id, $fn, $sz, $ca, datetime('now'))`,
-    { $id: id, $fn: filename, $sz: sizeBytes, $ca: createdAt }
-  );
-  run(
-    `INSERT OR REPLACE INTO versions (version, artifact_id, notes)
-      VALUES ($v, $id, NULL)`,
-    { $v: version, $id: id }
-  );
+  run.insertArtifact({ id, filename, sizeBytes, createdAt }, true);
+  run.insertVersion(version, id, true);
 }
 
 function upsertArtifactAndVersion(run, mode, id, version, filename, sizeBytes, createdAt, options = {}) {
@@ -154,13 +281,9 @@ function upsertArtifactAndVersion(run, mode, id, version, filename, sizeBytes, c
       break;
 
     case 'import':
-      const existingVersionRows = run('SELECT artifact_id FROM versions WHERE version = $v LIMIT 1', { $v: version });
-      const existingVersion = existingVersionRows?.[0];
+      const existingVersion = run.getVersion(version);
       if (existingVersion && String(existingVersion.artifact_id) !== String(id)) {
-        const existingArtifactRows = run('SELECT id, size_bytes, created_at FROM artifacts WHERE id = $id LIMIT 1', {
-          $id: existingVersion.artifact_id
-        });
-        const existingArtifact = existingArtifactRows?.[0];
+        const existingArtifact = run.getArtifact(existingVersion.artifact_id);
         conflictInfo = existingArtifact
           ? {
               existingId: String(existingArtifact.id),
@@ -187,21 +310,12 @@ function upsertArtifactAndVersion(run, mode, id, version, filename, sizeBytes, c
 
 function updateLatest(run) {
   // Maintain synthetic 'latest' using artifact created_at, falling back to version desc.
-  const rows = run(
-    `SELECT v.version AS version, v.artifact_id AS artifact_id
-     FROM versions v JOIN artifacts a ON a.id = v.artifact_id
-     WHERE v.version != 'latest'
-     ORDER BY datetime(a.created_at) DESC, v.version DESC
-     LIMIT 1`
-  );
+  const newestVersion = run.getLatestVersion();
+  const rows = newestVersion ? [newestVersion] : undefined;
   process.stdout.write('rows -> ' + JSON.stringify(rows) + '\n');
   const newest = rows?.length ? rows[0] : {};
   if (!newest?.version || !newest?.artifact_id) return;
-  run(
-    `INSERT OR REPLACE INTO versions (version, artifact_id, notes)
-     VALUES ('latest', $id, NULL)`,
-    { $id: newest.artifact_id }
-  );
+  run.insertVersion('latest', newest.artifact_id, true);
 }
 
 
@@ -238,40 +352,18 @@ async function cmdImport({ rootDir, config, filePath, force }) {
 
   const sizeBytes = fs.statSync(destPath).size;
 
-  // Update SQLite
-  const dbPath = path.resolve(rootDir, config.dbPath);
-  const schemaPath = path.resolve(rootDir, 'schema.sql');
-  const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
+  // Update database
+  const db = openDb({ rootDir, config });
+  const run = db;
+  // process.stdout.write('run('+operation+') -> ' + JSON.stringify(params) + '\n');
 
-  const SQL = await initSqlJs({
-    locateFile: (file) => {
-      const packaged = fs.existsSync(path.join(rootDir, file));
-      if (packaged) return path.join(rootDir, file);
-      return path.join(rootDir, 'node_modules', 'sql.js', 'dist', file);
-    }
-  });
-
-  const db = openDb({ SQL, dbPath, schemaSql });
-
-  const run = (sqlquery, params = {}) => {
-    // process.stdout.write('run('+sqlquery+') -> ' + JSON.stringify(params) + '\n');
-    const stmt = db.prepare(sqlquery);
-    stmt.bind(params);
-    const rows = [];
-    while (stmt.step()) {
-      rows.push(stmt.getAsObject());
-    }
-    stmt.free();
-    return rows.length ? rows : undefined;
-  };
-
-  run('BEGIN');
+  run.begin();
   let conflictInfo = null;
   let versionInserted = false;
   let upsertResult = upsertArtifactAndVersion(run, 'import', id, version, filename, sizeBytes, date, { force });
   if (upsertResult === null) {
     // Conflict, not forced
-    try { run('ROLLBACK'); } catch { /* ignore */ }
+    try { run.rollback(); } catch { /* ignore */ }
     const msg = `version ${version} already mapped to artifact (use --force to overwrite)`;
     process.stderr.write(msg + '\n');
     process.stdout.write(
@@ -284,9 +376,7 @@ async function cmdImport({ rootDir, config, filePath, force }) {
   }
 
   updateLatest(run);
-  run('COMMIT');
-
-  saveDbAtomic(db, dbPath);
+  run.commit();
 
   process.stdout.write(
     JSON.stringify({ ok: true, mode: 'import', id, filename, version, sizeBytes }, null, 2) + '\n'
@@ -302,31 +392,9 @@ async function cmdImport({ rootDir, config, filePath, force }) {
 }
 
 async function cmdRefresh({ rootDir, config }) {
-  const dbPath = path.resolve(rootDir, config.dbPath);
-  const schemaPath = path.resolve(rootDir, 'schema.sql');
-  const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
-
-  const SQL = await initSqlJs({
-    locateFile: (file) => {
-      const packaged = fs.existsSync(path.join(rootDir, file));
-      if (packaged) return path.join(rootDir, file);
-      return path.join(rootDir, 'node_modules', 'sql.js', 'dist', file);
-    }
-  });
-
-  const db = openDb({ SQL, dbPath, schemaSql });
-
-  const run = (sqlquery, params = {}) => {
-    // process.stdout.write('run('+sqlquery+') -> ' + JSON.stringify(params) + '\n');
-    const stmt = db.prepare(sqlquery);
-    stmt.bind(params);
-    const rows = [];
-    while (stmt.step()) {
-      rows.push(stmt.getAsObject());
-    }
-    stmt.free();
-    return rows.length ? rows : undefined;
-  };
+  const db = openDb({ rootDir, config });
+  const run = db;
+  // process.stdout.write('run('+operation+') -> ' + JSON.stringify(params) + '\n');
 
   // Scan disk - read id from hash file inside each artifact
   const artifactsDir = path.resolve(rootDir, ARTIFACTS_DIR);
@@ -358,7 +426,7 @@ async function cmdRefresh({ rootDir, config }) {
   }
 
   // get list of artifacts from DB
-  const dbArtifacts = run('SELECT id FROM artifacts') || [];
+  const dbArtifacts = run.listArtifacts() || [];
   const dbIds = new Set(dbArtifacts.map((row) => String(row.id)));
 
   // process.stdout.write('dbArtifacts -> ' + JSON.stringify(dbArtifacts) + '\n');
@@ -366,24 +434,20 @@ async function cmdRefresh({ rootDir, config }) {
   let added = 0;
   let removed = 0;
 
-  run('BEGIN');
+  run.begin();
   try {
     // Remove DB entries for missing artifacts (by id)
     for (const row of dbArtifacts) {
       const id = String(row.id);
       if (!diskArtifacts.has(id)) {
-        run('DELETE FROM versions WHERE artifact_id = $id', { $id: id });
-        run('DELETE FROM artifacts WHERE id = $id', { $id: id });
+        run.deleteVersionsForArtifact(id);
+        run.deleteArtifact(id);
         process.stderr.write(`[refresh] removed missing artifact from DB: ${id}\n`);
         removed++;
       }
     }
 
-    const versionRows = run(
-      `SELECT v.version AS version, v.artifact_id AS artifact_id, a.size_bytes AS size_bytes, a.created_at AS created_at
-       FROM versions v LEFT JOIN artifacts a ON a.id = v.artifact_id
-       WHERE v.version != 'latest'`
-    ) || [];
+    const versionRows = run.listVersions().filter(row => row.version != 'latest');
     process.stdout.write('versionRows -> ' + JSON.stringify(versionRows, null, 2) + '\n');
 
     const existingVersions = new Map(versionRows.map(row => [row.version, {
@@ -431,13 +495,11 @@ async function cmdRefresh({ rootDir, config }) {
 
     updateLatest(run);
 
-    run('COMMIT');
+    run.commit();
   } catch (err) {
-    try { run('ROLLBACK'); } catch { /* ignore */ }
+    try { run.rollback(); } catch { /* ignore */ }
     throw err;
   }
-
-  saveDbAtomic(db, dbPath);
 
   // Build artifacts output with status from diskArtifacts + skipped items
   const artifacts = [];
@@ -484,7 +546,7 @@ export async function runArtifactsCli({ argv, rootDir, config }) {
   usage(2);
 }
 
-// Shared programmatic refresh (disk -> SQLite) for reuse in index.js
+// Shared programmatic refresh (disk -> database) for reuse in index.js
 export async function refreshArtifacts({ rootDir, config }) {
   return cmdRefresh({ rootDir, config });
 }
